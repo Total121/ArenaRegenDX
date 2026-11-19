@@ -1,0 +1,24 @@
+# ============================================================================
+# ArenaRegenDX — Sound effects
+# ============================================================================
+# All sounds use the Bukkit Sound enum names. Volume is 0.0..1.0 (1.0 = max).
+# Pitch is 0.5..2.0 (1.0 = normal).
+
+enabled: true
+volume: 1.0
+pitch: 1.0
+
+# Played when a selection corner is set.
+select-pos1: BLOCK_NOTE_BLOCK_PLING
+select-pos2: BLOCK_NOTE_BLOCK_BELL
+
+# Played when a snapshot is saved / loaded.
+snapshot-saved: UI_TOAST_CHALLENGE_COMPLETE
+snapshot-loaded: BLOCK_BEACON_POWER_SELECT
+
+# Played when a regeneration starts / completes.
+regen-start: BLOCK_PISTON_EXTEND
+regen-complete: BLOCK_BEACON_ACTIVATE
+
+# Played on errors.
+error: BLOCK_NOTE_BLOCK_BASS

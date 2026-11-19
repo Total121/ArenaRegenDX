@@ -1,0 +1,57 @@
+# ArenaRegenDX — Performance
+# Defaults are tuned so a healthy 20 TPS Paper box never feels the restore.
+
+# Max block writes per tick at full TPS. Actual work also stops when the
+# millisecond budget is spent, whichever comes first.
+max-block-budget: 20000
+
+# Hard cap on restore time inside one tick (milliseconds). This is the
+# setting that keeps TPS stable on huge arenas. 6ms is ~12% of a tick.
+max-tick-millis: 6.0
+
+# Global restore speed multiplier (percent).
+# 40 = slow, 100 = normal, 200 = fast, 350 = max.
+# Per-arena overrides live in arenas.yml as regen-speed-percent (-1 = inherit).
+regen-speed-percent: 100
+
+# Skip blocks that already match the snapshot (and air-to-air).
+# Leave on. Chests still restore because they carry tile data.
+delta-skip: true
+
+# If true, skip tile restore when the BlockData already matches.
+# Default false so looted chests are refilled.
+skip-unchanged-tiles: false
+
+# Record broken/placed/exploded voxels and restore only those.
+# Empty set after restart still does a full restore (safe).
+dirty-tracking: true
+
+# If more than this fraction of the arena is dirty, do a full restore.
+dirty-full-threshold: 0.35
+
+# Use Paper NMS Level.setBlock (no neighbour physics). Falls back to Bukkit.
+nms-writes: true
+
+# Prefer CraftBlockEntityState snapshot NBT for chests/signs/etc.
+nbt-tiles: true
+
+# Folia: restore this many chunks per tick (each on its region thread).
+# Paper stays at 1 regardless — serial is safer on a single scheduler.
+parallel-chunks: 4
+
+# Adventure boss bar while a restore is running.
+progress-bar: true
+
+tps-full: 19.5
+tps-throttle: 18.0
+tps-crawl: 14.0
+
+# Chunks scanned per tick during snapshot capture.
+chunk-batch-size: 8
+
+async-snapshots: true
+async-compression: true
+queue-worker-threads: 2
+
+auto-match-regen: true
+regen-countdown-seconds: 3

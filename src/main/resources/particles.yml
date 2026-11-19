@@ -1,0 +1,18 @@
+# ArenaRegenDX — Selection dust
+enabled: true
+
+# Particle type names are unused for the overlay (always DUST with colours)
+# but kept so older configs merge cleanly.
+border-particle: DUST
+corner-particle: DUST
+fill-particle: DUST
+
+# Higher = denser edges and wall grids. Nearby faces are filled fully.
+border-density: 16
+
+# Refresh period. 8 ticks is smooth without packet spam.
+refresh-interval-ticks: 8
+
+animated-borders: true
+# Only particles inside this radius of the player are drawn, so walls stay dense.
+view-distance-blocks: 80.0

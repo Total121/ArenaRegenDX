@@ -1,0 +1,89 @@
+# ============================================================================
+# ArenaRegenDX - High-performance arena regeneration
+# Author: DravoraX
+# License: Licensed exclusively to DravoraX
+# Paper / Folia 1.21.8+ · Java 21+
+# ============================================================================
+name: ArenaRegenDX
+version: '${version}'
+main: com.dravorax.arenaregendx.ArenaRegenDXPlugin
+api-version: '1.21'
+author: DravoraX
+website: https://dravorax.net
+description: >
+  High-performance arena snapshot and restore engine. Paletted delta restore,
+  exclusion zones (protect spawn inside a warzone), dust selection overlays.
+  Folia-safe. Zero telemetry.
+
+folia-supported: true
+
+softdepend:
+  - PlaceholderAPI
+  - WorldEdit
+  - WorldGuard
+
+commands:
+  ardx:
+    description: Main ArenaRegenDX command
+    usage: /ardx help
+    aliases: [arenaregendx, arenaregen, sregen, sar]
+    permission: arenaregendx.use
+    permission-message: "&cYou do not have permission to use ArenaRegenDX."
+
+permissions:
+  arenaregendx.*:
+    description: All ArenaRegenDX permissions
+    children:
+      arenaregendx.use: true
+      arenaregendx.admin: true
+      arenaregendx.create: true
+      arenaregendx.delete: true
+      arenaregendx.save: true
+      arenaregendx.load: true
+      arenaregendx.regen: true
+      arenaregendx.cancel: true
+      arenaregendx.gui: true
+      arenaregendx.wand: true
+      arenaregendx.reload: true
+      arenaregendx.debug: true
+      arenaregendx.bypass: true
+    default: op
+  arenaregendx.use:
+    description: Base access to /ardx (subcommand perms still apply)
+    default: op
+  arenaregendx.admin:
+    description: Access to admin tools and status
+    default: op
+  arenaregendx.create:
+    description: Create arenas and exclusion zones
+    default: op
+  arenaregendx.delete:
+    description: Delete arenas
+    default: op
+  arenaregendx.save:
+    description: Save arena snapshots
+    default: op
+  arenaregendx.load:
+    description: Load arena snapshots
+    default: op
+  arenaregendx.regen:
+    description: Restore arenas
+    default: op
+  arenaregendx.cancel:
+    description: Cancel a running restore
+    default: op
+  arenaregendx.gui:
+    description: Open GUI menus
+    default: op
+  arenaregendx.wand:
+    description: Obtain the selection wand
+    default: op
+  arenaregendx.reload:
+    description: Reload configuration
+    default: op
+  arenaregendx.debug:
+    description: View debug information
+    default: op
+  arenaregendx.bypass:
+    description: Bypass safe-mode entity lift
+    default: op

@@ -1,0 +1,19 @@
+# ============================================================================
+# ArenaRegenDX — Arena metadata storage
+# ============================================================================
+# This file is managed automatically by the plugin. Manual edits are possible
+# but may be overwritten — use commands (/ardx create / delete) instead.
+#
+# Format:
+#   arenas:
+#     <name>:
+#       world: <world-name>
+#       origin: { x: <int>, y: <int>, z: <int> }
+#       size:   { x: <int>, y: <int>, z: <int> }
+#       created-at: <epoch-millis>
+#       latest-snapshot: <long>
+#       last-regenerated: <epoch-millis>
+#       snapshot-count: <int>
+#       status: <EMPTY|READY|REGENERATING|SAVING|ERROR>
+
+arenas: {}

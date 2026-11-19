@@ -1,0 +1,29 @@
+# ============================================================================
+# ArenaRegenDX — General configuration
+# Author: DravoraX
+# ============================================================================
+
+# General plugin settings.
+debug: false          # set to true for verbose logging (use sparingly in production)
+language: en          # reserved for future i18n; messages.yml is the source of truth
+
+# Whether to print the ASCII banner on enable.
+banner: true
+
+# Whether the selection wand is globally enabled (per-player permission still applies).
+wand-enabled: true
+
+# Whether to use the player's WorldEdit selection as a fallback when no ArenaRegenDX
+# selection exists (requires WorldEdit).
+prefer-worldedit-selection: false
+
+# Auto-regeneration triggers. These keys are live (also toggled in /ardx gui → settings).
+# When an event damages an arena that has a snapshot, that arena is queued.
+auto-regen:
+  on-explosion: true
+  on-fire: false        # optional — can cause extra regens in lava arenas
+  on-piston: false
+
+# Safe-mode default (teleport entities out of voxels before placing solid blocks).
+# Players with arenaregendx.bypass skip safe mode.
+safe-mode-default: true

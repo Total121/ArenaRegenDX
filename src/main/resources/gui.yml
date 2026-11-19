@@ -1,0 +1,10 @@
+# ArenaRegenDX — GUI
+# Inventory titles use MiniMessage. Small-caps are applied in code.
+
+titles:
+  main: "<dark_gray>› <gradient:#7af0d8:#f7c948>ᴀʀᴇɴᴀ ʀᴇɢᴇɴ ᴅx</gradient> <dark_gray>‹"
+  arena-manager: "<dark_gray>› <aqua>ᴀʀᴇɴᴀꜱ <dark_gray>‹"
+  settings: "<dark_gray>› <aqua>ꜱᴇᴛᴛɪɴɢꜱ <dark_gray>‹"
+  performance: "<dark_gray>› <aqua>ᴘᴇʀꜰᴏʀᴍᴀɴᴄᴇ <dark_gray>‹"
+
+arena-manager-page-size: 16

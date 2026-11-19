@@ -1,0 +1,102 @@
+/*
+ * ArenaRegenDX build configuration
+ * Paper 1.21.8+ / Folia 1.21.8+ / Java 21+
+ *
+ * Author: DravoraX
+ * License: Licensed exclusively to DravoraX
+ */
+
+plugins {
+    id 'java'
+    id 'java-library'
+    id 'maven-publish'
+}
+
+group = 'com.dravorax.arenaregendx'
+version = '2.1.0'
+archivesBaseName = 'ArenaRegenDX'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    compileJava.options.encoding = 'UTF-8'
+    compileJava.options.release = 21
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'papermc-repo'
+        url = 'https://repo.papermc.io/repository/maven-public/'
+    }
+    maven {
+        name = 'spigotmc-repo'
+        url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/'
+    }
+    maven {
+        name = 'papi-repo'
+        url = 'https://repo.extendedclip.com/content/repositories/placeholderapi/'
+    }
+    maven {
+        name = 'sk89q-repo'
+        url = 'https://maven.enginehub.org/repo/'
+    }
+    maven {
+        name = 'sonatype'
+        url = 'https://oss.sonatype.org/content/groups/public/'
+    }
+}
+
+dependencies {
+    compileOnly 'io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT'
+    compileOnly 'net.kyori:adventure-api:4.17.0'
+    compileOnly 'net.kyori:adventure-text-minimessage:4.17.0'
+    compileOnly 'net.kyori:adventure-text-serializer-legacy:4.17.0'
+    compileOnly('me.clip:placeholderapi:2.11.6') { transitive = false }
+    compileOnly('com.sk89q.worldedit:worldedit-bukkit:7.3.6') { transitive = false }
+    compileOnly('com.sk89q.worldguard:worldguard-bukkit:7.0.12') { transitive = false }
+    compileOnly 'org.jetbrains:annotations:24.1.0'
+}
+
+processResources {
+    filesMatching('plugin.yml') {
+        expand(version: project.version)
+    }
+}
+
+jar {
+    archiveFileName = "${archivesBaseName}-${version}.jar"
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+javadoc {
+    options {
+        encoding = 'UTF-8'
+        charSet = 'UTF-8'
+        author = true
+        version = true
+        use = true
+        windowTitle = 'ArenaRegenDX API'
+        docTitle = "<h1>ArenaRegenDX API v${project.version}</h1>"
+        bottom = 'Copyright &#169; 2026 DravoraX. All rights reserved.'
+        addStringOption('Xdoclint:none', '-quiet')
+    }
+    failOnError = false
+}
+
+compileJava {
+    options.compilerArgs += ['-Xlint:all', '-Xlint:-processing', '-parameters']
+    options.deprecation = true
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            groupId = project.group
+            artifactId = archivesBaseName
+            version = project.version
+        }
+    }
+}

@@ -1,0 +1,54 @@
+# ============================================================================
+# ArenaRegenDX — Messages (MiniMessage format)
+# Author: DravoraX
+# ============================================================================
+# All user-facing strings use MiniMessage tags. See:
+# https://docs.advntr.dev/minimessage/format.html
+# Variables are written as <name> in the source and substituted by the plugin.
+
+# Prefix prepended to most messages (kept empty so commands can format their own).
+prefix: "<dark_gray>[<gold>ARDX<dark_gray>] "
+
+# Generic
+no-permission: "<red>You lack permission: <yellow><perm>"
+player-only: "<red>This command can only be run by a player."
+unknown-command: "<red>Unknown subcommand. Try <gold>/ardx help"
+
+# Arena lifecycle
+arena-created: "<dark_gray>» <gold>Arena <yellow><name> <green>created <dark_gray>(<yellow><size><dark_gray>)."
+arena-deleted: "<dark_gray>» <gold>Arena <yellow><name> <red>deleted<dark_gray>."
+arena-not-found: "<red>Arena not found: <yellow><name>"
+arena-exists: "<red>Arena already exists: <yellow><name>"
+
+# Selection
+selection-pos1: "<gold>Position 1 <dark_gray>» <yellow><x>, <y>, <z>"
+selection-pos2: "<yellow>Position 2 <dark_gray>» <gold><x>, <y>, <z>"
+selection-incomplete: "<red>You must select a region first (use <gold>/ardx wand<red>)."
+selection-different-worlds: "<red>Both corners must be in the same world."
+
+# Snapshots
+snapshot-saving: "<dark_gray>» <gold>Saving snapshot for <yellow><name><dark_gray>..."
+snapshot-saved: "<dark_gray>» <green>Snapshot saved <dark_gray>(<yellow>#<id><dark_gray>, <yellow><blocks> blocks<dark_gray>, <yellow><size><dark_gray>, <yellow><ms>ms<dark_gray>)."
+snapshot-load-failed: "<red>Snapshot load failed: <yellow><reason>"
+snapshot-not-found: "<red>Arena has no snapshot. Run <gold>/ardx save <name> <red>first."
+
+# Regeneration
+regen-started: "<dark_gray>» <gold>Regenerating arena <yellow><name> <dark_gray>(mode: <yellow><mode><dark_gray>)..."
+regen-complete: "<dark_gray>» <green>Regeneration complete <dark_gray>(<yellow><blocks> blocks<dark_gray>)."
+regen-failed: "<red>Regen failed: <yellow><reason>"
+regen-queue-full: "<red>Regeneration queue is full. Try again shortly."
+
+# Status / debug
+status-header: "<dark_gray>» <gold>ArenaRegenDX <dark_gray>« <dark_gray>Status"
+
+# GUI
+gui-main-title: "<dark_gray>» <gold>ArenaRegenDX <dark_gray>«"
+gui-arena-manager-title: "<dark_gray>» <gold>Arena Manager <dark_gray>«"
+gui-settings-title: "<dark_gray>» <gold>Settings <dark_gray>«"
+gui-performance-title: "<dark_gray>» <gold>Performance <dark_gray>«"
+
+# Help
+help-header: "<dark_gray>» <gold>ArenaRegenDX <dark_gray>« <dark_gray>Help"
+
+# Reload
+reloaded: "<dark_gray>» <green>Configuration reloaded."
