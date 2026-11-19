@@ -191,6 +191,8 @@ public final class ArenaRegenDXPlugin extends JavaPlugin {
         if (scheduler != null) {
             scheduler.cancelOwnedTasks();
         }
+        // 9. Static caches outlive the plugin instance on reload.
+        FastBlockWriter.clearCache();
 
         instance = null;
         getSLF4JLogger().info("ArenaRegenDX disabled. Goodbye!");

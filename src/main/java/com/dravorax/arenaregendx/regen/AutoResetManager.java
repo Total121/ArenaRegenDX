@@ -77,14 +77,17 @@ public final class AutoResetManager {
      */
     private void tick() {
         if (countdowns.isEmpty()) return;
-        for (final var entry : countdowns.entrySet()) {
-            final String arenaName = entry.getKey();
-            long remaining = entry.getValue();
-            if (remaining <= 0) {
+        for (final String arenaName : countdowns.keySet()) {
+            // computeIfPresent: a countdown stopped concurrently (delete / rename /
+            // GUI toggle) must not be resurrected by a blind put().
+            final Long next = countdowns.computeIfPresent(arenaName, (k, v) -> v > 0 ? v - 1 : v);
+            if (next == null) {
                 continue;
             }
-            remaining--;
-            countdowns.put(arenaName, remaining);
+            final long remaining = next;
+            if (remaining < 0) {
+                continue;
+            }
 
             // Check if we hit a broadcast threshold.
             for (final long threshold : BROADCAST_THRESHOLDS) {
@@ -94,8 +97,9 @@ public final class AutoResetManager {
                 }
             }
 
-            // At zero, trigger regeneration and reset the timer.
-            if (remaining <= 0) {
+            // At zero, trigger regeneration once; park the timer at -1 until the
+            // restore finishes so a slow restore is not re-triggered every second.
+            if (remaining == 0 && countdowns.replace(arenaName, 0L, -1L)) {
                 triggerAutoRegen(arenaName);
             }
         }
@@ -178,13 +182,13 @@ public final class AutoResetManager {
         final boolean allowDirty = plugin.configManager().performance().dirtyTracking;
         regenManager.regen(arenaName, mode, true, allowDirty)
                 .whenComplete((task, err) -> {
-                    if (err == null) {
-                        // Restart the countdown for the next cycle.
-                        startCountdown(arena);
-                    } else {
+                    if (err != null) {
                         plugin.getSLF4JLogger().warn("[AutoReset] Regen failed for '{}': {}",
                                 arenaName, err.getMessage());
-                        // Restart anyway so it tries again next cycle.
+                    }
+                    // Restart for the next cycle only if the arena still exists under
+                    // this name and nobody stopped its countdown meanwhile.
+                    if (arenaManager.getArena(arena.name()) == arena && countdowns.containsKey(arena.name())) {
                         startCountdown(arena);
                     }
                 });

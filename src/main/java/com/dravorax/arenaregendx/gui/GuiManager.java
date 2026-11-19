@@ -142,7 +142,7 @@ public final class GuiManager implements Listener {
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInventoryClick(@NotNull final InventoryClickEvent event) {
         final Inventory top = event.getView().getTopInventory();
-        if (!(top.getHolder() instanceof GuiHolder holder)) {
+        if (!(top.getHolder(false) instanceof GuiHolder holder)) {
             return;
         }
         event.setCancelled(true); // our GUIs are read/action-only, never item-movable
@@ -175,14 +175,14 @@ public final class GuiManager implements Listener {
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInventoryDrag(@NotNull final InventoryDragEvent event) {
-        if (event.getView().getTopInventory().getHolder() instanceof GuiHolder) {
+        if (event.getView().getTopInventory().getHolder(false) instanceof GuiHolder) {
             event.setCancelled(true);
         }
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInventoryCreative(@NotNull final InventoryCreativeEvent event) {
-        if (event.getView().getTopInventory().getHolder() instanceof GuiHolder) {
+        if (event.getView().getTopInventory().getHolder(false) instanceof GuiHolder) {
             event.setCancelled(true);
         }
     }
@@ -190,7 +190,7 @@ public final class GuiManager implements Listener {
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onSwapHands(@NotNull final PlayerSwapHandItemsEvent event) {
         final var open = event.getPlayer().getOpenInventory().getTopInventory();
-        if (open.getHolder() instanceof GuiHolder) {
+        if (open.getHolder(false) instanceof GuiHolder) {
             event.setCancelled(true);
         }
     }
@@ -198,7 +198,7 @@ public final class GuiManager implements Listener {
     @EventHandler(priority = EventPriority.MONITOR)
     public void onInventoryClose(@NotNull final InventoryCloseEvent event) {
         if (event.getPlayer() instanceof Player player
-                && event.getView().getTopInventory().getHolder() instanceof GuiHolder holder
+                && event.getView().getTopInventory().getHolder(false) instanceof GuiHolder holder
                 && holder.type() == GuiType.ARENA_EDIT) {
             com.dravorax.arenaregendx.gui.menus.ArenaEditMenu.clearPending(player.getUniqueId());
         }
@@ -228,14 +228,21 @@ public final class GuiManager implements Listener {
      * Shutdown: close all open GUIs.
      */
     public void shutdown() {
-        for (final UUID id : sessions.keySet()) {
-            final Player p = plugin.getServer().getPlayer(id);
-            if (p != null) {
-                plugin.scheduler().runAtEntity(p, p::closeInventory);
+        // Runs from onDisable: schedulers reject tasks from a disabled plugin, so
+        // close directly. Once our listener is unregistered an open menu would let
+        // players take its items, so every viewer of one of our holders is closed.
+        for (final Player p : plugin.getServer().getOnlinePlayers()) {
+            try {
+                if (p.getOpenInventory().getTopInventory().getHolder(false) instanceof GuiHolder) {
+                    p.closeInventory();
+                }
+            } catch (final Throwable t) {
+                plugin.getSLF4JLogger().debug("Could not close GUI for {}", p.getName(), t);
             }
         }
         sessions.clear();
         lastClickNanos.clear();
+        com.dravorax.arenaregendx.gui.menus.ArenaEditMenu.clearAllPending();
     }
 
     // -----------------------------------------------------------------------

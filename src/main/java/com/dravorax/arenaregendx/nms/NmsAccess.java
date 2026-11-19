@@ -65,8 +65,10 @@ public final class NmsAccess {
         try {
             final Class<?> craftWorld = Class.forName("org.bukkit.craftbukkit.CraftWorld");
             final Class<?> craftData = Class.forName("org.bukkit.craftbukkit.block.data.CraftBlockData");
-            getHandle = MethodHandles.lookup().unreflect(craftWorld.getMethod("getHandle"));
-            getNmsState = MethodHandles.lookup().unreflect(craftData.getMethod("getState"));
+            getHandle = MethodHandles.lookup().unreflect(craftWorld.getMethod("getHandle"))
+                    .asType(MethodType.methodType(Object.class, Object.class));
+            getNmsState = MethodHandles.lookup().unreflect(craftData.getMethod("getState"))
+                    .asType(MethodType.methodType(Object.class, Object.class));
 
             Class<?> blockPos = load("net.minecraft.core.BlockPos");
             blockPosCtor = blockPos.getConstructor(int.class, int.class, int.class);
@@ -85,7 +87,8 @@ public final class NmsAccess {
             if (set == null) {
                 throw new IllegalStateException("Level.setBlock not found");
             }
-            setBlock = MethodHandles.lookup().unreflect(set);
+            setBlock = MethodHandles.lookup().unreflect(set)
+                    .asType(MethodType.methodType(void.class, Object.class, Object.class, Object.class, int.class));
 
             try {
                 final Class<?> craftBes = Class.forName("org.bukkit.craftbukkit.block.CraftBlockEntityState");
@@ -135,7 +138,21 @@ public final class NmsAccess {
     public static @Nullable Object nmsState(@NotNull final BlockData data) {
         if (GET_NMS_STATE == null) return null;
         try {
-            return GET_NMS_STATE.invoke(data);
+            return (Object) GET_NMS_STATE.invokeExact((Object) data);
+        } catch (final Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Resolve the NMS level for a world once so per-voxel writes skip the lookup.
+     *
+     * @return the ServerLevel, or {@code null} when NMS is unavailable.
+     */
+    public static @Nullable Object levelHandle(@NotNull final World world) {
+        if (!AVAILABLE) return null;
+        try {
+            return (Object) GET_HANDLE.invokeExact((Object) world);
         } catch (final Throwable t) {
             return null;
         }
@@ -143,17 +160,26 @@ public final class NmsAccess {
 
     public static boolean setBlock(@NotNull final World world, final int x, final int y, final int z,
                                    @NotNull final Object nmsState) {
+        final Object level = levelHandle(world);
+        return level != null && setBlock(level, x, y, z, nmsState);
+    }
+
+    /** Physics-free write on a pre-resolved level (see {@link #levelHandle(World)}). */
+    public static boolean setBlock(@NotNull final Object level, final int x, final int y, final int z,
+                                   @NotNull final Object nmsState) {
         if (!AVAILABLE) return false;
+        final Object pos;
         try {
-            final Object level = GET_HANDLE.invoke(world);
-            final Object pos = BLOCK_POS_CTOR.newInstance(x, y, z);
-            SET_BLOCK.invoke(level, pos, nmsState, FLAGS_NO_PHYSICS);
+            pos = BLOCK_POS_CTOR.newInstance(x, y, z);
+        } catch (final Throwable t) {
+            return false;
+        }
+        try {
+            SET_BLOCK.invokeExact(level, pos, nmsState, FLAGS_NO_PHYSICS);
             return true;
         } catch (final Throwable t) {
             try {
-                final Object level = GET_HANDLE.invoke(world);
-                final Object pos = BLOCK_POS_CTOR.newInstance(x, y, z);
-                SET_BLOCK.invoke(level, pos, nmsState, 2 | 16);
+                SET_BLOCK.invokeExact(level, pos, nmsState, 2 | 16);
                 return true;
             } catch (final Throwable t2) {
                 return false;
@@ -260,10 +286,15 @@ public final class NmsAccess {
     }
 
     private static @Nullable Method findNbtWrite(@NotNull final Class<?> nbtIo, @NotNull final Class<?> compound) {
+        // Must be the uncompressed DataOutput overload: readTag() uses read(DataInput),
+        // so picking writeCompressed(..., OutputStream) or write(..., Path) would
+        // produce payloads that can never be read back.
         for (final Method m : nbtIo.getMethods()) {
-            if (!m.getName().equals("write") && !m.getName().equals("writeCompressed")) continue;
+            if (!m.getName().equals("write")) continue;
             final Class<?>[] p = m.getParameterTypes();
-            if (p.length == 2 && (p[0] == compound || p[1] == compound)) {
+            if (p.length != 2) continue;
+            if ((p[0] == compound && p[1] == java.io.DataOutput.class)
+                    || (p[1] == compound && p[0] == java.io.DataOutput.class)) {
                 m.setAccessible(true);
                 return m;
             }
@@ -273,8 +304,9 @@ public final class NmsAccess {
 
     private static @Nullable Method findNbtRead(@NotNull final Class<?> nbtIo, @NotNull final Class<?> compound) {
         for (final Method m : nbtIo.getMethods()) {
-            if (!m.getName().equals("read") && !m.getName().equals("readCompressed")) continue;
-            if (m.getParameterCount() == 1 && m.getReturnType() == compound) {
+            if (!m.getName().equals("read")) continue;
+            if (m.getParameterCount() == 1 && m.getReturnType() == compound
+                    && m.getParameterTypes()[0] == java.io.DataInput.class) {
                 m.setAccessible(true);
                 return m;
             }

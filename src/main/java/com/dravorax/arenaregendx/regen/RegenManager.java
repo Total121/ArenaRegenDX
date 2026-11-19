@@ -66,6 +66,19 @@ public final class RegenManager {
     /** True if a batch from {@link #current} is in-flight (awaiting completion). */
     private volatile boolean batchInFlight = false;
 
+    /**
+     * Generation of the in-flight batch. A batch callback only releases
+     * {@link #batchInFlight} if its generation is still current, so a batch the
+     * watchdog gave up on can never release a newer batch early.
+     */
+    private final java.util.concurrent.atomic.AtomicLong batchGeneration = new java.util.concurrent.atomic.AtomicLong();
+
+    /** When the in-flight batch was dispatched (for the stall watchdog). */
+    private volatile long batchStartedNanos;
+
+    /** A batch that has not reported back after this long is considered lost. */
+    private static final long BATCH_STALL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
+
     /** All known active jobs (queue + current), keyed by job id, for status queries. */
     private final ConcurrentMap<UUID, ActiveJob> allJobs = new ConcurrentHashMap<>();
 
@@ -112,7 +125,21 @@ public final class RegenManager {
      */
     private void tick() {
         if (batchInFlight) {
-            return; // wait for the in-flight batch
+            if (System.nanoTime() - batchStartedNanos < BATCH_STALL_NANOS) {
+                return; // wait for the in-flight batch
+            }
+            // Watchdog: a region task never came back (world unloaded, region
+            // stalled...). Fail the job instead of deadlocking the whole queue.
+            batchGeneration.incrementAndGet();
+            batchInFlight = false;
+            final ActiveJob stalled = current;
+            plugin.getSLF4JLogger().error("Regen batch for '{}' did not complete within 60s — aborting job.",
+                    stalled == null ? "?" : stalled.arenaName);
+            if (stalled != null) {
+                stalled.task.markFailed();
+                current = null;
+            }
+            return;
         }
         // Pop the next job if the current is done.
         if (current != null && current.task.isDone()) {
@@ -125,6 +152,8 @@ public final class RegenManager {
             }
         }
         // Dispatch the next batch.
+        final long gen = batchGeneration.incrementAndGet();
+        batchStartedNanos = System.nanoTime();
         batchInFlight = true;
         final int speedPercent = Math.max(10, Math.min(500, current.speedPercent));
         final double speedMul = speedPercent / 100.0;
@@ -135,7 +164,11 @@ public final class RegenManager {
                 Math.max(50_000L, tpsMonitor.adaptiveNanosBudget()) * speedMul));
         final ActiveJob job = current;
         try {
-            job.task.applyBatch(budget, nanoBudget, () -> batchInFlight = false);
+            job.task.applyBatch(budget, nanoBudget, () -> {
+                if (batchGeneration.get() == gen) {
+                    batchInFlight = false;
+                }
+            });
         } catch (final Throwable t) {
             plugin.getSLF4JLogger().error("Regen batch dispatch failed for job {}", job.id, t);
             batchInFlight = false;
@@ -256,11 +289,9 @@ public final class RegenManager {
             final long regenStart = System.currentTimeMillis();
             snapshot.resolvePalette();
             final var perf = configManager.performance();
-            plugin.changeTracker().setEnabled(perf.dirtyTracking);
-            plugin.changeTracker().setFullThreshold(perf.dirtyFullThreshold);
-            final java.util.List<Long> dirty = (allowDirty && perf.dirtyTracking)
-                    ? plugin.changeTracker().snapshotForRestore(arena)
-                    : null;
+            // Take the recorded voxels and start a fresh baseline in one step, so
+            // blocks broken while this restore runs are tracked for the next one.
+            final long[] dirty = plugin.changeTracker().detachForRestore(arena, allowDirty && perf.dirtyTracking);
             final int parallel = com.dravorax.arenaregendx.scheduler.SchedulerProvider.isFolia()
                     ? perf.parallelChunks : 1;
             final RegenProgressBar bar = perf.progressBar ? new RegenProgressBar(arena.name(), scheduler) : null;
@@ -319,6 +350,11 @@ public final class RegenManager {
         }
         starting.remove(key, token);
         final ActiveJob j = findByTask(t);
+        if (t.isCancelled() || t.isFailed()) {
+            // The world is now somewhere between "damaged" and "restored": the
+            // next restore must be a full one.
+            plugin.changeTracker().invalidate(arena.name());
+        }
         if (t.isCancelled()) {
             if (arenaManager.getArena(arena.name()) != null
                     && arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.REGENERATING) {
@@ -355,7 +391,8 @@ public final class RegenManager {
             }
             return;
         }
-        plugin.changeTracker().clear(arena.name());
+        // Do NOT clear the tracker here: it was re-armed when the restore started
+        // and now holds exactly the changes made since then.
         arena.markRegenerated();
         arenaManager.saveArena(arena);
         playArenaSound(arena, configManager.sounds().regenComplete);
@@ -414,7 +451,12 @@ public final class RegenManager {
                 arena.spawnYaw(), arena.spawnPitch());
         arenaManager.forEachPlayerInArena(arena, player -> {
             try {
-                player.teleport(spawn);
+                // teleportAsync: synchronous teleport throws on Folia and the spawn
+                // may live in another region.
+                player.teleportAsync(spawn).exceptionally(t -> {
+                    plugin.getSLF4JLogger().warn("Could not teleport {} to spawn", player.getName(), t);
+                    return false;
+                });
             } catch (final Throwable t) {
                 plugin.getSLF4JLogger().warn("Could not teleport {} to spawn", player.getName(), t);
             }

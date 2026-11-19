@@ -36,6 +36,9 @@ public final class Snapshot {
     private volatile BlockData[] palette;
     /** True when the matching palette entry is air (skip-air fast path). */
     private volatile boolean[] airFlags;
+    /** Flat indices that carry a tile-entity payload (null = none). */
+    private volatile java.util.BitSet tileMask;
+    private volatile boolean tileMaskBuilt;
 
     public Snapshot(final int sizeX, final int sizeY, final int sizeZ,
                     final long createdAt,
@@ -133,6 +136,45 @@ public final class Snapshot {
     public @NotNull BlockData[] palette() {
         resolvePalette();
         return palette;
+    }
+
+    /**
+     * @return a bitmask of flat indices that have tile-entity payloads, or
+     *         {@code null} when the snapshot has none. Lets restore skip the
+     *         per-voxel boxed map lookup.
+     */
+    public @Nullable java.util.BitSet tileMask() {
+        if (tileMaskBuilt) {
+            return tileMask;
+        }
+        synchronized (this) {
+            if (!tileMaskBuilt) {
+                if (!tileEntities.isEmpty()) {
+                    final java.util.BitSet mask = new java.util.BitSet();
+                    for (final Integer key : tileEntities.keySet()) {
+                        if (key != null && key >= 0) mask.set(key);
+                    }
+                    tileMask = mask;
+                }
+                tileMaskBuilt = true;
+            }
+            return tileMask;
+        }
+    }
+
+    /** Approximate retained heap size, used to bound the snapshot cache. */
+    public long approximateBytes() {
+        long bytes = 64L + (long) blockDataIds.length * 4L;
+        for (final String s : uniqueBlockData) {
+            bytes += 48L + (s == null ? 0 : s.length() * 2L);
+        }
+        for (final byte[] v : tileEntities.values()) {
+            bytes += 48L + (v == null ? 0 : v.length);
+        }
+        for (final EntityPayload e : entities) {
+            bytes += 96L + e.payload().length;
+        }
+        return bytes;
     }
 
     public boolean @NotNull [] airFlags() {

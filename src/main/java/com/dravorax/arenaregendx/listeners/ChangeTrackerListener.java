@@ -186,7 +186,7 @@ public final class ChangeTrackerListener implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onInventoryClose(@NotNull final InventoryCloseEvent event) {
-        final var holder = event.getInventory().getHolder();
+        final var holder = event.getInventory().getHolder(false);
         if (holder instanceof org.bukkit.block.BlockState state) {
             tracker.mark(state.getLocation());
         } else if (holder instanceof org.bukkit.block.DoubleChest dc) {

@@ -127,11 +127,12 @@ public final class SelectionVisualizer {
 
     private void drawSelection(@NotNull final Player player, @NotNull final Selection sel,
                                @NotNull final Settings.ParticleSettings ps, final float phase) {
-        final ParticleCounter counter = new ParticleCounter();
+        final ParticleCounter counter = new ParticleCounter(player, ps);
         if (sel.isComplete()) {
             final Location min = sel.min();
             final Location max = sel.max();
             if (min == null || max == null) return;
+            if (min.getWorld() != player.getWorld()) return; // selection is in another world
             drawCuboid(player, min.getBlockX(), min.getBlockY(), min.getBlockZ(),
                     max.getBlockX() + 1, max.getBlockY() + 1, max.getBlockZ() + 1,
                     GOLD, CYAN, true, ps, phase, counter);
@@ -147,7 +148,7 @@ public final class SelectionVisualizer {
                              @NotNull final Settings.ParticleSettings ps, final float phase) {
         final World world = player.getWorld();
         if (!world.getName().equals(arena.worldName())) return;
-        final ParticleCounter counter = new ParticleCounter();
+        final ParticleCounter counter = new ParticleCounter(player, ps);
         drawCuboid(player,
                 arena.originX(), arena.originY(), arena.originZ(),
                 arena.originX() + arena.sizeX(), arena.originY() + arena.sizeY(), arena.originZ() + arena.sizeZ(),
@@ -223,7 +224,7 @@ public final class SelectionVisualizer {
                               final int x2, final int y2, final int z2,
                               final double step, @NotNull final ParticleCounter counter,
                               @NotNull final Settings.ParticleSettings ps) {
-        final Location eye = player.getEyeLocation();
+        final Location eye = counter.eye;
         final double view = Math.max(24.0, ps.viewDistanceBlocks);
         final double viewSq = view * view;
 
@@ -239,11 +240,16 @@ public final class SelectionVisualizer {
                                   final int x1, final int x2, final int y1, final int y2, final int z,
                                   final double step, @NotNull final ParticleCounter counter,
                                   @NotNull final Location eye, final double viewSq) {
-        if (!faceNear(eye, (x1 + x2) * 0.5, (y1 + y2) * 0.5, z, viewSq * 1.6)) {
+        final double view = Math.sqrt(viewSq);
+        if (Math.abs(eye.getZ() - z) > view) {
             return;
         }
-        for (double x = x1; x <= x2 + 0.001; x += step) {
-            for (double y = y1; y <= y2 + 0.001; y += step) {
+        // Only walk the part of the face inside the view cube; huge arenas
+        // previously iterated every grid point of every face on each refresh.
+        final double xEnd = Math.min(x2, eye.getX() + view) + 0.001;
+        final double yEnd = Math.min(y2, eye.getY() + view) + 0.001;
+        for (double x = alignedStart(x1, eye.getX() - view, step); x <= xEnd; x += step) {
+            for (double y = alignedStart(y1, eye.getY() - view, step); y <= yEnd; y += step) {
                 spawnDustNear(player, dust, x, y, z, counter, eye, viewSq);
             }
         }
@@ -253,11 +259,14 @@ public final class SelectionVisualizer {
                               final int x, final int y1, final int y2, final int z1, final int z2,
                               final double step, @NotNull final ParticleCounter counter,
                               @NotNull final Location eye, final double viewSq) {
-        if (!faceNear(eye, x, (y1 + y2) * 0.5, (z1 + z2) * 0.5, viewSq * 1.6)) {
+        final double view = Math.sqrt(viewSq);
+        if (Math.abs(eye.getX() - x) > view) {
             return;
         }
-        for (double z = z1; z <= z2 + 0.001; z += step) {
-            for (double y = y1; y <= y2 + 0.001; y += step) {
+        final double zEnd = Math.min(z2, eye.getZ() + view) + 0.001;
+        final double yEnd = Math.min(y2, eye.getY() + view) + 0.001;
+        for (double z = alignedStart(z1, eye.getZ() - view, step); z <= zEnd; z += step) {
+            for (double y = alignedStart(y1, eye.getY() - view, step); y <= yEnd; y += step) {
                 spawnDustNear(player, dust, x, y, z, counter, eye, viewSq);
             }
         }
@@ -267,22 +276,25 @@ public final class SelectionVisualizer {
                                     final int x1, final int x2, final int y, final int z1, final int z2,
                                     final double step, @NotNull final ParticleCounter counter,
                                     @NotNull final Location eye, final double viewSq) {
-        if (!faceNear(eye, (x1 + x2) * 0.5, y, (z1 + z2) * 0.5, viewSq * 1.6)) {
+        final double view = Math.sqrt(viewSq);
+        if (Math.abs(eye.getY() - y) > view) {
             return;
         }
-        for (double x = x1; x <= x2 + 0.001; x += step) {
-            for (double z = z1; z <= z2 + 0.001; z += step) {
+        final double xEnd = Math.min(x2, eye.getX() + view) + 0.001;
+        final double zEnd = Math.min(z2, eye.getZ() + view) + 0.001;
+        for (double x = alignedStart(x1, eye.getX() - view, step); x <= xEnd; x += step) {
+            for (double z = alignedStart(z1, eye.getZ() - view, step); z <= zEnd; z += step) {
                 spawnDustNear(player, dust, x, y, z, counter, eye, viewSq);
             }
         }
     }
 
-    private boolean faceNear(@NotNull final Location eye, final double x, final double y, final double z,
-                             final double maxSq) {
-        final double dx = eye.getX() - x;
-        final double dy = eye.getY() - y;
-        final double dz = eye.getZ() - z;
-        return dx * dx + dy * dy + dz * dz <= maxSq;
+    /** First grid point {@code >= lo} on the grid {@code origin + k*step} (keeps the grid stable as the player moves). */
+    private static double alignedStart(final double origin, final double lo, final double step) {
+        if (lo <= origin) {
+            return origin;
+        }
+        return origin + Math.ceil((lo - origin) / step) * step;
     }
 
     private void drawSphere(@NotNull final Player player, final double cx, final double cy, final double cz,
@@ -355,7 +367,11 @@ public final class SelectionVisualizer {
         if (dx * dx + dy * dy + dz * dz > viewSq) {
             return;
         }
-        spawnDust(player, dust, x, y, z, 1, 0.0, counter, null);
+        if (!counter.allow()) return;
+        try {
+            player.spawnParticle(Particle.DUST, x, y, z, 1, 0.0, 0.0, 0.0, 0.0, dust);
+        } catch (final Throwable ignored) {
+        }
     }
 
     private void spawnDust(@NotNull final Player player, @NotNull final Particle.DustOptions dust,
@@ -363,17 +379,16 @@ public final class SelectionVisualizer {
                            final int count, final double extra,
                            @NotNull final ParticleCounter counter,
                            @Nullable final Settings.ParticleSettings ps) {
-        if (!counter.allow()) return;
         if (ps != null) {
-            final Location eye = player.getEyeLocation();
-            final double view = Math.max(32.0, ps.viewDistanceBlocks + 8.0);
-            final double dx = eye.getX() - x;
-            final double dy = eye.getY() - y;
-            final double dz = eye.getZ() - z;
-            if (dx * dx + dy * dy + dz * dz > view * view) {
+            // Eye position is captured once per draw (was one Location allocation per particle).
+            final double dx = counter.eye.getX() - x;
+            final double dy = counter.eye.getY() - y;
+            final double dz = counter.eye.getZ() - z;
+            if (dx * dx + dy * dy + dz * dz > counter.edgeViewSq) {
                 return;
             }
         }
+        if (!counter.allow()) return;
         try {
             player.spawnParticle(Particle.DUST, x, y, z, count, extra, extra, extra, 0.0, dust);
         } catch (final Throwable ignored) {
@@ -400,7 +415,16 @@ public final class SelectionVisualizer {
     }
 
     private static final class ParticleCounter {
+        final Location eye;
+        final double edgeViewSq;
         int count;
+
+        ParticleCounter(@NotNull final Player player, @NotNull final Settings.ParticleSettings ps) {
+            this.eye = player.getEyeLocation();
+            final double view = Math.max(32.0, ps.viewDistanceBlocks + 8.0);
+            this.edgeViewSq = view * view;
+        }
+
 
         boolean allow() {
             return ++count <= MAX_PARTICLES;

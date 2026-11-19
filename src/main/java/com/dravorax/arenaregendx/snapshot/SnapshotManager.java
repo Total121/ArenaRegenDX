@@ -70,8 +70,12 @@ public final class SnapshotManager {
     /** Snapshot-id generator per arena (persisted alongside arena metadata). */
     private final Map<String, AtomicLong> idCounters = new ConcurrentHashMap<>();
 
-    /** In-memory cache of loaded snapshots. */
-    private final Map<String, Snapshot> cache = new ConcurrentHashMap<>();
+    /**
+     * Byte-weighted LRU of loaded snapshots. Bounded by both entry count and an
+     * estimate of retained heap so large arenas cannot pin gigabytes.
+     */
+    private final SnapshotCache cache = new SnapshotCache(
+            16, Math.max(32L << 20, Runtime.getRuntime().maxMemory() / 8L));
 
     public SnapshotManager(@NotNull final ArenaRegenDXPlugin plugin,
                            @NotNull final ConfigManager configManager,
@@ -116,9 +120,16 @@ public final class SnapshotManager {
                                                                      @NotNull final World world,
                                                                      @NotNull final Location min,
                                                                      @NotNull final Location max) {
+        // The snapshot becomes the new baseline: start recording changes now so
+        // edits made while the scan is still running are not lost.
+        try {
+            plugin.changeTracker().arm(arenaName);
+        } catch (final Throwable t) {
+            plugin.getSLF4JLogger().debug("changeTracker arm before save failed", t);
+        }
         // 1. Scan (region-thread reads), then serialize+compress+write in a single
         //    composed stage so the snapshot reference stays in scope throughout.
-        return scanner.scan(world, min, max).thenComposeAsync(snapshot -> {
+        final CompletableFuture<SnapshotMetadata> result = scanner.scan(world, min, max).thenComposeAsync(snapshot -> {
             // 2. Serialize + compress (CPU pool).
             return CompletableFuture.supplyAsync(() -> {
                 final Settings.StorageSettings storage = configManager.storage();
@@ -138,7 +149,7 @@ public final class SnapshotManager {
                     final long snapshotId = nextSnapshotId(arenaName);
                     final File file = snapshotFile(arenaName, snapshotId);
                     try {
-                        Files.write(file.toPath(), bytes);
+                        writeAtomically(file, bytes);
                     } catch (final IOException e) {
                         throw new RuntimeException("Snapshot write failed: " + file, e);
                     }
@@ -149,21 +160,10 @@ public final class SnapshotManager {
                             snapshot.createdAt(), snapshot.blockCount(),
                             file.length(), configManager.storage().compression != Settings.StorageSettings.CompressionType.NONE
                     );
-                    // Cache the snapshot so an immediate regen doesn't re-read from disk.
+                    // Older snapshots of this arena are rarely restored again: free them,
+                    // then cache the new one so an immediate regen skips the disk read.
+                    cache.removeArena(arenaName);
                     cache.put(cacheKey(arenaName, snapshotId), snapshot);
-                    // Soft LRU: drop older entries if cache grows too large.
-                    if (cache.size() > 48) {
-                        final var it = cache.entrySet().iterator();
-                        while (cache.size() > 32 && it.hasNext()) {
-                            it.next();
-                            it.remove();
-                        }
-                    }
-                    try {
-                        plugin.changeTracker().clear(arenaName);
-                    } catch (final Throwable t) {
-                        plugin.getSLF4JLogger().debug("changeTracker clear after save failed", t);
-                    }
                     // Fire the public event on the global region (never from disk I/O).
                     final SnapshotMetadata eventMeta = meta;
                     scheduler.runGlobal(() -> {
@@ -178,6 +178,26 @@ public final class SnapshotManager {
                 }, diskWriter);
             });
         }, compressionPool);
+        result.whenComplete((meta, err) -> {
+            if (err != null) {
+                // Baseline never materialised: force the next restore to be full.
+                plugin.changeTracker().invalidate(arenaName);
+            }
+        });
+        return result;
+    }
+
+    /** Write to a temp file then move into place, so a crash never leaves a torn snapshot. */
+    private static void writeAtomically(@NotNull final File file, final byte @NotNull [] bytes) throws IOException {
+        final java.nio.file.Path target = file.toPath();
+        final java.nio.file.Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        Files.write(tmp, bytes);
+        try {
+            Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (final java.nio.file.AtomicMoveNotSupportedException e) {
+            Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     /**
@@ -230,13 +250,13 @@ public final class SnapshotManager {
             }
             for (final File f : files) {
                 try {
-                    final byte[] bytes = Files.readAllBytes(f.toPath());
-                    final SnapshotSerializer.HeaderInfo h = SnapshotSerializer.readHeader(bytes);
+                    // Only the fixed-size header is needed; never read whole snapshots here.
+                    final SnapshotSerializer.HeaderInfo h = SnapshotSerializer.readHeader(readHeaderBytes(f));
                     final long snapshotId = parseSnapshotId(f.getName());
                     list.add(new SnapshotMetadata(
                             arenaName, snapshotId, "", 0, 0, 0,
                             h.sizeX(), h.sizeY(), h.sizeZ(),
-                            h.createdAt(), h.sizeX() * h.sizeY() * h.sizeZ(),
+                            h.createdAt(), (int) Math.min(Integer.MAX_VALUE, (long) h.sizeX() * h.sizeY() * h.sizeZ()),
                             f.length(), h.compressed()
                     ));
                 } catch (final Exception e) {
@@ -263,8 +283,9 @@ public final class SnapshotManager {
      * Delete all snapshots for an arena (used when an arena is deleted).
      */
     public void deleteAllSnapshots(@NotNull final String arenaName) {
-        // Evict cache entries.
-        cache.keySet().removeIf(k -> k.startsWith(arenaName + ":"));
+        // Evict cache entries and the id counter (no leak per deleted arena).
+        cache.removeArena(arenaName);
+        idCounters.remove(arenaName);
         diskWriter.submit(() -> {
             final File dir = arenaDir(arenaName);
             if (!dir.exists()) return;
@@ -350,19 +371,7 @@ public final class SnapshotManager {
         if (counter != null) {
             idCounters.put(newName, counter);
         }
-        final String oldPrefix = oldName + ":";
-        final List<String> keys = new ArrayList<>();
-        for (final String key : cache.keySet()) {
-            if (key.startsWith(oldPrefix)) {
-                keys.add(key);
-            }
-        }
-        for (final String key : keys) {
-            final Snapshot snap = cache.remove(key);
-            if (snap == null) continue;
-            final String suffix = key.substring(oldPrefix.length());
-            cache.put(newName + ":" + suffix, snap);
-        }
+        cache.renameArena(oldName, newName);
     }
 
     /**
@@ -435,6 +444,12 @@ public final class SnapshotManager {
         return max;
     }
 
+    private static byte @NotNull [] readHeaderBytes(@NotNull final File f) throws IOException {
+        try (java.io.InputStream in = Files.newInputStream(f.toPath())) {
+            return in.readNBytes(SnapshotSerializer.HEADER_BYTES);
+        }
+    }
+
     private static long parseSnapshotId(@NotNull final String filename) {
         final int dot = filename.lastIndexOf('.');
         if (dot <= 0) return 0L;
@@ -466,7 +481,8 @@ public final class SnapshotManager {
                 final File[] files = dir.listFiles((d, name) -> name.endsWith(".ardx") || name.endsWith(".sarp"));
                 if (files == null || files.length == 0) return;
                 final List<File> sorted = new ArrayList<>(List.of(files));
-                sorted.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+                // Newest id first (ids are monotonic; mtimes can be touched by backups).
+                sorted.sort((a, b) -> Long.compare(parseSnapshotId(b.getName()), parseSnapshotId(a.getName())));
                 final int max = maxSnapshotsPerArena();
                 for (int i = max; i < sorted.size(); i++) {
                     final File f = sorted.get(i);
@@ -480,5 +496,87 @@ public final class SnapshotManager {
                 plugin.getSLF4JLogger().warn("Snapshot prune failed for {}", arenaName, e);
             }
         });
+    }
+
+    /**
+     * Small LRU keyed by {@code arena:id}, bounded by entry count and by the
+     * approximate retained size of the snapshots it holds.
+     */
+    private static final class SnapshotCache {
+        private final int maxEntries;
+        private final long maxBytes;
+        private final java.util.LinkedHashMap<String, Snapshot> map = new java.util.LinkedHashMap<>(16, 0.75f, true);
+        private final Map<String, Long> weights = new java.util.HashMap<>();
+        private long totalBytes;
+
+        SnapshotCache(final int maxEntries, final long maxBytes) {
+            this.maxEntries = maxEntries;
+            this.maxBytes = maxBytes;
+        }
+
+        synchronized @org.jetbrains.annotations.Nullable Snapshot get(@NotNull final String key) {
+            return map.get(key);
+        }
+
+        synchronized void put(@NotNull final String key, @NotNull final Snapshot snapshot) {
+            final long weight = snapshot.approximateBytes();
+            remove(key);
+            if (weight > maxBytes) {
+                return; // would evict everything else and still not fit
+            }
+            map.put(key, snapshot);
+            weights.put(key, weight);
+            totalBytes += weight;
+            final var it = map.entrySet().iterator();
+            while ((map.size() > maxEntries || totalBytes > maxBytes) && it.hasNext()) {
+                final String eldest = it.next().getKey();
+                if (eldest.equals(key)) continue;
+                it.remove();
+                final Long w = weights.remove(eldest);
+                if (w != null) totalBytes -= w;
+            }
+        }
+
+        synchronized void remove(@NotNull final String key) {
+            if (map.remove(key) != null) {
+                final Long w = weights.remove(key);
+                if (w != null) totalBytes -= w;
+            }
+        }
+
+        synchronized void removeArena(@NotNull final String arenaName) {
+            final String prefix = arenaName + ":";
+            final var it = map.keySet().iterator();
+            while (it.hasNext()) {
+                final String k = it.next();
+                if (k.startsWith(prefix)) {
+                    it.remove();
+                    final Long w = weights.remove(k);
+                    if (w != null) totalBytes -= w;
+                }
+            }
+        }
+
+        synchronized void renameArena(@NotNull final String oldName, @NotNull final String newName) {
+            final String prefix = oldName + ":";
+            final List<String> keys = new ArrayList<>();
+            for (final String k : map.keySet()) {
+                if (k.startsWith(prefix)) keys.add(k);
+            }
+            for (final String k : keys) {
+                final Snapshot snap = map.remove(k);
+                final Long w = weights.remove(k);
+                if (w != null) totalBytes -= w;
+                if (snap != null) {
+                    put(newName + ":" + k.substring(prefix.length()), snap);
+                }
+            }
+        }
+
+        synchronized void clear() {
+            map.clear();
+            weights.clear();
+            totalBytes = 0L;
+        }
     }
 }

@@ -136,16 +136,9 @@ public final class ArenaRegenAPI {
         if (arena == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("Arena not found: " + arenaName));
         }
-        final World world = org.bukkit.Bukkit.getWorld(arena.worldName());
-        if (world == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("World not loaded: " + arena.worldName()));
-        }
-        final Location min = new Location(world, arena.originX(), arena.originY(), arena.originZ());
-        final Location max = new Location(world,
-                arena.originX() + arena.sizeX() - 1,
-                arena.originY() + arena.sizeY() - 1,
-                arena.originZ() + arena.sizeZ() - 1);
-        return snapshotManager().saveSnapshot(arenaName, world, min, max);
+        // Same path as /ardx save: marks SAVING, records the new restore point,
+        // persists and prunes. (Previously the API wrote a file the arena never used.)
+        return arenaManager().captureSnapshot(arena);
     }
 
     /**

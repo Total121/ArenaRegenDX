@@ -458,7 +458,10 @@ public final class TileEntitySerializer {
             final Skull s = (Skull) state;
             final String name = readNullableString(in);
             if (!name.isEmpty()) {
-                try { s.setOwningPlayer(Bukkit.getOfflinePlayer(name)); } catch (final Exception ignored) {}
+                // Bukkit.getOfflinePlayer(name) can block on a Mojang lookup on the
+                // region thread. A name-only profile is resolved by the server
+                // asynchronously instead.
+                try { s.setPlayerProfile(Bukkit.createProfile(name)); } catch (final Exception ignored) {}
             }
         }
     }

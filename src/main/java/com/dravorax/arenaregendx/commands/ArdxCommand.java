@@ -165,18 +165,15 @@ public final class ArdxCommand implements TabExecutor {
             selectionManager.clear(player);
             playSound(player, "BLOCK_NOTE_BLOCK_PLING");
             msg(sender, "<dark_gray>» <gold>Capturing snapshot...");
-            snapshotManager.saveSnapshot(name, world, min, max).thenAccept(meta -> {
-                arena.onSnapshotSaved(meta.snapshotId());
-                arenaManager.saveArena(arena);
+            arenaManager.captureSnapshot(arena).thenAccept(meta -> {
                 msg(sender, "<dark_gray>» <green>Snapshot saved <dark_gray>(<yellow>#"
                         + meta.snapshotId() + "<dark_gray>, <yellow>" + meta.blockCount() + " blocks<dark_gray>).");
-                msg(sender, "<dark_gray>» Protect spawn with <gold>/ardx exclude add " + name + " spawn");
+                msg(sender, "<dark_gray>» Protect spawn with <gold>/ardx exclude add " + arena.name() + " spawn");
                 if (finalAutoReset > 0) {
                     autoResetManager.startCountdown(arena);
                 }
             }).exceptionally(t -> {
-                msg(sender, "<red>Auto-save failed: <yellow>" + t.getMessage());
-                plugin.getSLF4JLogger().error("Auto-save failed for {}", name, t);
+                msg(sender, "<red>Auto-save failed: <yellow>" + rootMessage(t));
                 return null;
             });
         } catch (final IllegalArgumentException e) {
@@ -486,39 +483,15 @@ public final class ArdxCommand implements TabExecutor {
             msg(sender, "<red>Cannot save while the arena is regenerating or already saving.");
             return true;
         }
-        final World world = Bukkit.getWorld(arena.worldName());
-        if (world == null) {
-            msg(sender, "<red>World not loaded: <yellow>" + arena.worldName());
-            return true;
-        }
-        final Location min = new Location(world, arena.originX(), arena.originY(), arena.originZ());
-        final Location max = new Location(world,
-                arena.originX() + arena.sizeX() - 1,
-                arena.originY() + arena.sizeY() - 1,
-                arena.originZ() + arena.sizeZ() - 1);
-        arena.setStatus(ArenaStatus.SAVING);
         msg(sender, "<dark_gray>» <gold>Saving <yellow>" + arena.name() + "<gold>...");
         final long start = System.currentTimeMillis();
-        snapshotManager.saveSnapshot(arena.name(), world, min, max).thenAccept(meta -> {
-            plugin.scheduler().runGlobal(() -> {
-                if (arenaManager.getArena(arena.name()) == null) return;
-                arena.onSnapshotSaved(meta.snapshotId());
-                arena.setStatus(ArenaStatus.READY);
-                arenaManager.saveArena(arena);
-            });
+        arenaManager.captureSnapshot(arena).thenAccept(meta -> {
             msg(sender, "<dark_gray>» <green>Saved <dark_gray>(<yellow>#" + meta.snapshotId()
                     + "<dark_gray>, <yellow>" + meta.blockCount() + " blocks<dark_gray>, <yellow>"
                     + humanSize(meta.fileSize()) + "<dark_gray>, <yellow>"
                     + (System.currentTimeMillis() - start) + "ms<dark_gray>).");
-            snapshotManager.pruneOldSnapshots(arena.name());
         }).exceptionally(t -> {
-            plugin.scheduler().runGlobal(() -> {
-                if (arenaManager.getArena(arena.name()) != null) {
-                    arena.setStatus(ArenaStatus.ERROR);
-                }
-            });
-            msg(sender, "<red>Save failed: <yellow>" + t.getMessage());
-            plugin.getSLF4JLogger().error("Snapshot save failed for {}", arena.name(), t);
+            msg(sender, "<red>Save failed: <yellow>" + rootMessage(t));
             return null;
         });
         return true;
@@ -553,7 +526,7 @@ public final class ArdxCommand implements TabExecutor {
             msg(sender, "<dark_gray>» <green>Loaded <yellow>" + s.blockCount()
                     + " <green>blocks. Restore with <gold>/ardx regen " + arena.name());
         }).exceptionally(t -> {
-            msg(sender, "<red>Load failed: <yellow>" + t.getMessage());
+            msg(sender, "<red>Load failed: <yellow>" + rootMessage(t));
             return null;
         });
         return true;
@@ -585,7 +558,7 @@ public final class ArdxCommand implements TabExecutor {
                     + " <green>written, <yellow>" + task.blocksSkipped()
                     + " <green>skipped, <yellow>" + task.blocksExcluded() + " <green>excluded.");
         }).exceptionally(t -> {
-            msg(sender, "<red>Regen failed: <yellow>" + t.getMessage());
+            msg(sender, "<red>Regen failed: <yellow>" + rootMessage(t));
             return null;
         });
         return true;
@@ -840,6 +813,16 @@ public final class ArdxCommand implements TabExecutor {
             plugin.scheduler().runAtEntity(player, () ->
                     player.playSound(player.getLocation(), s, sounds.volume, sounds.pitch));
         }
+    }
+
+    /** CompletionException wraps the real cause; show the useful message. */
+    private static @NotNull String rootMessage(@NotNull final Throwable t) {
+        Throwable c = t;
+        while ((c instanceof java.util.concurrent.CompletionException
+                || c instanceof java.util.concurrent.ExecutionException) && c.getCause() != null) {
+            c = c.getCause();
+        }
+        return c.getMessage() == null ? c.getClass().getSimpleName() : c.getMessage();
     }
 
     private static @NotNull String humanSize(final long bytes) {

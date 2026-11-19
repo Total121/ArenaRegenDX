@@ -27,6 +27,10 @@ public final class ArenaEditMenu {
     private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, String> pendingDelete =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    public static void clearAllPending() {
+        pendingDelete.clear();
+    }
+
     public static void clearPending(@NotNull final java.util.UUID playerId) {
         pendingDelete.remove(playerId);
     }
@@ -212,34 +216,12 @@ public final class ArenaEditMenu {
                     return;
                 }
                 player.closeInventory();
-                final var world = org.bukkit.Bukkit.getWorld(arena.worldName());
-                if (world == null) {
-                    player.sendMessage(ColorUtil.mini("<red>" + ColorUtil.smallCaps("world not loaded")));
-                    return;
-                }
-                final var min = new org.bukkit.Location(world, arena.originX(), arena.originY(), arena.originZ());
-                final var max = new org.bukkit.Location(world,
-                        arena.originX() + arena.sizeX() - 1,
-                        arena.originY() + arena.sizeY() - 1,
-                        arena.originZ() + arena.sizeZ() - 1);
                 player.sendMessage(ColorUtil.mini("<dark_gray>› <gold>"
                         + ColorUtil.smallCaps("saving ") + "<aqua>" + arena.name()));
-                arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.SAVING);
-                gm.plugin().snapshotManager().saveSnapshot(arena.name(), world, min, max).thenAccept(meta -> {
-                    gm.plugin().scheduler().runGlobal(() -> {
-                        if (gm.arenaManager().getArena(arena.name()) == null) return;
-                        arena.onSnapshotSaved(meta.snapshotId());
-                        arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.READY);
-                        gm.arenaManager().saveArena(arena);
-                    });
-                    gm.plugin().scheduler().runAtEntity(player, () -> player.sendMessage(ColorUtil.mini(
-                            "<dark_gray>› <green>" + ColorUtil.smallCaps("saved ") + "<aqua>#" + meta.snapshotId())));
-                }).exceptionally(t -> {
-                    gm.plugin().scheduler().runGlobal(() -> {
-                        if (gm.arenaManager().getArena(arena.name()) != null) {
-                            arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.ERROR);
-                        }
-                    });
+                gm.arenaManager().captureSnapshot(arena).thenAccept(meta ->
+                        gm.plugin().scheduler().runAtEntity(player, () -> player.sendMessage(ColorUtil.mini(
+                                "<dark_gray>› <green>" + ColorUtil.smallCaps("saved ") + "<aqua>#" + meta.snapshotId())))
+                ).exceptionally(t -> {
                     gm.plugin().scheduler().runAtEntity(player, () -> player.sendMessage(ColorUtil.mini(
                             "<red>" + ColorUtil.smallCaps("save failed"))));
                     return null;

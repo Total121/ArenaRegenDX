@@ -11,6 +11,7 @@ import com.dravorax.arenaregendx.config.Settings;
 import com.dravorax.arenaregendx.scheduler.SchedulerAdapter;
 import com.dravorax.arenaregendx.scheduler.TaskHandle;
 import org.bukkit.Chunk;
+import org.bukkit.ChunkSnapshot;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -35,6 +36,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * @author DravoraX
  */
 public final class RegionScanner {
+
+    /** Fail a scan when no chunk has reported back for this long after dispatch. */
+    private static final long STALL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
 
     private final ArenaRegenDXPlugin plugin;
     private final SchedulerAdapter scheduler;
@@ -103,6 +107,8 @@ public final class RegionScanner {
         final int batchSize = Math.max(1, perfSupplier.get().chunkBatchSize);
         final long createdAt = System.currentTimeMillis();
         final TaskHandle[] handle = new TaskHandle[1];
+        final java.util.concurrent.atomic.AtomicLong lastProgress =
+                new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
 
         handle[0] = scheduler.runGlobalRepeating(() -> {
             if (future.isDone()) {
@@ -111,6 +117,13 @@ public final class RegionScanner {
             }
             final int start = cursor.getAndAdd(batchSize);
             if (start >= totalChunks) {
+                // Everything dispatched: watch for chunks that never report back
+                // (world unloaded, region gone) so the driver cannot run forever.
+                if (System.nanoTime() - lastProgress.get() > STALL_NANOS) {
+                    cancelDriver(handle);
+                    future.completeExceptionally(new IllegalStateException(
+                            "Region scan stalled — " + remaining.get() + " chunk(s) never completed"));
+                }
                 return;
             }
             final int end = Math.min(totalChunks, start + batchSize);
@@ -118,28 +131,53 @@ public final class RegionScanner {
                 final int[] chunk = chunkQueue.get(i);
                 final int cx = chunk[0];
                 final int cz = chunk[1];
-                final Location chunkCenter = new Location(world, (cx << 4) + 8, minY, (cz << 4) + 8);
-                scheduler.runAtLocation(chunkCenter, () -> {
-                    try {
-                        if (!scanFailed.get()) {
-                            scanChunk(world, cx, cz, minX, minY, minZ, sizeX, sizeY, sizeZ,
-                                    blockDataIds, dedup, palette, dedupLock, tileEntities, entities);
+                final Runnable chunkDone = () -> {
+                    lastProgress.set(System.nanoTime());
+                    if (remaining.decrementAndGet() == 0) {
+                        cancelDriver(handle);
+                        if (scanFailed.get()) {
+                            future.completeExceptionally(new IllegalStateException(
+                                    "Region scan failed — one or more chunks could not be captured"));
+                        } else {
+                            finishScan(future, sizeX, sizeY, sizeZ, createdAt,
+                                    palette, blockDataIds, tileEntities, entities, dedupLock);
                         }
+                    }
+                };
+                scheduler.runAtChunk(world, cx, cz, () -> {
+                    final ChunkSnapshot chunkSnap;
+                    try {
+                        if (scanFailed.get() || future.isDone()) {
+                            chunkDone.run();
+                            return;
+                        }
+                        // Region thread: only the cheap palette copy + tile/entity
+                        // capture (which must happen on the owning thread).
+                        chunkSnap = captureChunk(world, cx, cz, minX, minY, minZ, sizeX, sizeY, sizeZ,
+                                tileEntities, entities);
                     } catch (final Throwable t) {
                         plugin.getSLF4JLogger().error("Chunk scan failed at {},{}", cx, cz, t);
                         scanFailed.set(true);
-                    } finally {
-                        if (remaining.decrementAndGet() == 0) {
-                            cancelDriver(handle);
-                            if (scanFailed.get()) {
-                                future.completeExceptionally(new IllegalStateException(
-                                        "Region scan failed — one or more chunks could not be captured"));
-                            } else {
-                                finishScan(future, sizeX, sizeY, sizeZ, createdAt,
-                                        palette, blockDataIds, tileEntities, entities, dedupLock);
-                            }
-                        }
+                        chunkDone.run();
+                        return;
                     }
+                    // Async: the per-voxel BlockData walk + palette interning.
+                    scheduler.runAsync(() -> {
+                        try {
+                            if (!scanFailed.get()) {
+                                scanBlocks(chunkSnap, cx, cz, minX, minY, minZ, sizeX, sizeY, sizeZ,
+                                        blockDataIds, dedup, palette, dedupLock);
+                            }
+                        } catch (final Throwable t) {
+                            plugin.getSLF4JLogger().error("Chunk block scan failed at {},{}", cx, cz, t);
+                            scanFailed.set(true);
+                        } finally {
+                            chunkDone.run();
+                        }
+                    });
+                }, () -> {
+                    scanFailed.set(true);
+                    chunkDone.run();
                 });
             }
         }, 1L, 1L);
@@ -183,15 +221,55 @@ public final class RegionScanner {
         future.complete(snapshot);
     }
 
-    private void scanChunk(@NotNull final World world, final int chunkX, final int chunkZ,
-                           final int originX, final int originY, final int originZ,
-                           final int sizeX, final int sizeY, final int sizeZ,
-                           final int[] blockDataIds,
-                           @NotNull final Map<BlockData, Integer> dedup,
-                           @NotNull final List<BlockData> palette,
-                           @NotNull final Object dedupLock,
-                           @NotNull final Map<Integer, byte[]> tileEntities,
-                           @NotNull final List<Snapshot.EntityPayload> entities) {
+    /**
+     * Walk the chunk's voxels from an immutable {@link ChunkSnapshot}. Thread-safe;
+     * runs on the async pool so region threads only pay for the snapshot copy.
+     */
+    private void scanBlocks(@NotNull final ChunkSnapshot chunk, final int chunkX, final int chunkZ,
+                            final int originX, final int originY, final int originZ,
+                            final int sizeX, final int sizeY, final int sizeZ,
+                            final int[] blockDataIds,
+                            @NotNull final Map<BlockData, Integer> dedup,
+                            @NotNull final List<BlockData> palette,
+                            @NotNull final Object dedupLock) {
+        final int blockStartX = Math.max(originX, chunkX << 4);
+        final int blockEndX = Math.min(originX + sizeX - 1, (chunkX << 4) + 15);
+        final int blockStartZ = Math.max(originZ, chunkZ << 4);
+        final int blockEndZ = Math.min(originZ + sizeZ - 1, (chunkZ << 4) + 15);
+        final int blockEndY = originY + sizeY - 1;
+        // Local memo: consecutive voxels are usually the same state, so most
+        // lookups never touch the shared map.
+        BlockData lastData = null;
+        int lastId = -1;
+        for (int y = originY; y <= blockEndY; y++) {
+            for (int z = blockStartZ; z <= blockEndZ; z++) {
+                final int rowBase = sizeX * ((z - originZ) + sizeZ * (y - originY));
+                for (int x = blockStartX; x <= blockEndX; x++) {
+                    final BlockData data = chunk.getBlockData(x & 15, y, z & 15);
+                    final int dataId;
+                    if (lastData != null && lastData.equals(data)) {
+                        dataId = lastId;
+                    } else {
+                        dataId = intern(data, dedup, palette, dedupLock);
+                        lastData = data;
+                        lastId = dataId;
+                    }
+                    blockDataIds[(x - originX) + rowBase] = dataId;
+                }
+            }
+        }
+    }
+
+    /**
+     * Region-thread part of a chunk scan: load the chunk, copy its block palette
+     * into a {@link ChunkSnapshot}, and capture tile entities + entities (which
+     * must be read on the owning thread).
+     */
+    private @NotNull ChunkSnapshot captureChunk(@NotNull final World world, final int chunkX, final int chunkZ,
+                                                final int originX, final int originY, final int originZ,
+                                                final int sizeX, final int sizeY, final int sizeZ,
+                                                @NotNull final Map<Integer, byte[]> tileEntities,
+                                                @NotNull final List<Snapshot.EntityPayload> entities) {
         final Chunk chunk;
         try {
             chunk = world.getChunkAt(chunkX, chunkZ);
@@ -199,26 +277,7 @@ public final class RegionScanner {
             plugin.getSLF4JLogger().warn("Could not load chunk {},{}", chunkX, chunkZ, t);
             throw new IllegalStateException("Chunk load failed at " + chunkX + "," + chunkZ, t);
         }
-
-        final int blockStartX = Math.max(originX, chunkX << 4);
-        final int blockEndX = Math.min(originX + sizeX - 1, (chunkX << 4) + 15);
-        final int blockStartZ = Math.max(originZ, chunkZ << 4);
-        final int blockEndZ = Math.min(originZ + sizeZ - 1, (chunkZ << 4) + 15);
-        final int blockStartY = originY;
-        final int blockEndY = originY + sizeY - 1;
-
-        for (int y = blockStartY; y <= blockEndY; y++) {
-            for (int z = blockStartZ; z <= blockEndZ; z++) {
-                final int rz = z - originZ;
-                final int rowBase = sizeX * (rz + sizeZ * (y - originY));
-                for (int x = blockStartX; x <= blockEndX; x++) {
-                    final Block block = chunk.getBlock(x & 15, y, z & 15);
-                    final BlockData data = block.getBlockData();
-                    final int dataId = intern(data, dedup, palette, dedupLock);
-                    blockDataIds[(x - originX) + rowBase] = dataId;
-                }
-            }
-        }
+        final ChunkSnapshot snap = chunk.getChunkSnapshot(false, false, false);
 
         // Tile entities: iterate the chunk's tile list instead of getState() per block.
         try {
@@ -264,6 +323,7 @@ public final class RegionScanner {
                 plugin.getSLF4JLogger().warn("Entity capture failed for {}", entity.getType(), t);
             }
         }
+        return snap;
     }
 
     private int intern(@NotNull final BlockData data,

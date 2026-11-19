@@ -92,6 +92,9 @@ public final class SnapshotSerializer {
     public static final int COMPRESSION_GZIP = 1;
     public static final int COMPRESSION_ZLIB = 2;
 
+    /** Fixed header size: magic(4) version(1) flags(1) compression(1) reserved(1) createdAt(8) size(3x4). */
+    public static final int HEADER_BYTES = 28;
+
     private SnapshotSerializer() {
         // static utility
     }
@@ -287,14 +290,20 @@ public final class SnapshotSerializer {
         }
 
         // 2. RLE-decoded block array.
-        final int totalBlocks = sizeX * sizeY * sizeZ;
+        final long volume = (long) sizeX * sizeY * sizeZ;
+        if (sizeX <= 0 || sizeY <= 0 || sizeZ <= 0 || volume > 100_000_000L) {
+            throw new IOException("Corrupt snapshot: invalid dimensions " + sizeX + "x" + sizeY + "x" + sizeZ);
+        }
+        final int totalBlocks = (int) volume;
         final int[] ids = new int[totalBlocks];
         final int runCount = readVarInt(in);
         int pos = 0;
         for (int r = 0; r < runCount; r++) {
             final int dataId = readVarInt(in);
             final int len = readVarInt(in);
-            // Fill the run.
+            if (len < 0 || len > totalBlocks - pos || dataId < 0 || dataId >= uniqCount) {
+                throw new IOException("Corrupt snapshot: bad block run at " + pos);
+            }
             java.util.Arrays.fill(ids, pos, pos + len, dataId);
             pos += len;
         }

@@ -9,7 +9,9 @@ package com.dravorax.arenaregendx.regen;
 import com.dravorax.arenaregendx.ArenaRegenDXPlugin;
 import com.dravorax.arenaregendx.arena.ChangeTracker;
 import com.dravorax.arenaregendx.arena.ExclusionIndex;
+import com.dravorax.arenaregendx.nms.NmsAccess;
 import com.dravorax.arenaregendx.scheduler.SchedulerAdapter;
+import com.dravorax.arenaregendx.snapshot.EntitySerializer;
 import com.dravorax.arenaregendx.snapshot.Snapshot;
 import com.dravorax.arenaregendx.snapshot.TileEntitySerializer;
 import org.bukkit.Chunk;
@@ -22,10 +24,14 @@ import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.ItemFrame;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Painting;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,17 +39,26 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
- * Time-sliced restore job. One chunk is owned at a time so Paper keeps a hot
- * chunk in cache and Folia stays on the correct region thread.
+ * Time-sliced restore job. Work is dispatched one region at a time so Paper
+ * keeps a hot chunk in cache and Folia stays on the correct region thread.
  *
  * <p>Lag controls:</p>
  * <ul>
- *   <li>Pre-parsed {@link BlockData} palette — no string parse per voxel.</li>
+ *   <li>Pre-parsed {@link BlockData} palette and pre-resolved NMS states — no
+ *       string parse or map lookup per voxel.</li>
  *   <li>Delta skip — identical blocks (and air-to-air) are not written.</li>
  *   <li>Exclusion volumes are skipped entirely (protected spawn, etc.).</li>
- *   <li>Millisecond budget so a tick never runs longer than configured.</li>
+ *   <li>Millisecond + write budget per batch, checked per Y-layer / row.</li>
+ *   <li>A batch keeps going into the next chunk only while that chunk is owned
+ *       by the current thread's region, so one dispatch can cover many chunks
+ *       on Paper (and on a single Folia region) without ever crossing a region
+ *       boundary.</li>
  *   <li>Physics off. Tile entities restored only where the snapshot has them.</li>
  * </ul>
+ *
+ * <p>Threading: batches never overlap (the manager waits for {@code onBatchDone}),
+ * so the cursor fields have a single writer at any time; they are volatile for
+ * cross-thread visibility on Folia.</p>
  *
  * @author DravoraX
  */
@@ -69,17 +84,26 @@ public final class RegenTask {
     private final BlockData[] palette;
     private final boolean[] airFlags;
     private final Map<Integer, byte[]> tiles;
+    private final @Nullable BitSet tileMask;
+    /** Lazily resolved NMS block states per palette id (benign races: same value). */
+    private final Object[] nmsPalette;
+    private final @Nullable Object nmsLevel;
+    /** Wave centre and the largest Chebyshev radius that still touches the cuboid. */
+    private final int midX, midY, midZ, maxWaveRadius;
 
     /** Chunk cursor (row-major over the arena's chunk rectangle). */
     private volatile int chunkCursor = 0;
-    /** Relative Y start for the current chunk slice (INSTANT / CHUNK_BY_CHUNK). */
+    /** Relative Y start for the current chunk (INSTANT / CHUNK_BY_CHUNK). */
     private volatile int ySlice = 0;
-    /** Next relative Y to process inside the current layer (LAYER mode). */
+    /** Current relative Y layer (LAYER mode). */
     private volatile int layerY = 0;
-    /** Chebyshev radius for WAVE/ANIMATED (no O(n) sort). */
+    /** Chebyshev radius for ANIMATED (no O(n) sort). */
     private volatile int waveRadius = 0;
-
+    /** Resume point inside the current wave chunk (absolute y / z row), or MIN_VALUE. */
+    private volatile int waveResumeY = Integer.MIN_VALUE;
+    private volatile int waveResumeZ = Integer.MIN_VALUE;
     private volatile int dirtyCursor;
+
     /** Ensures {@link #onComplete} runs at most once (cancel / fail / success). */
     private final AtomicBoolean completionFired = new AtomicBoolean(false);
     private final AtomicInteger cursorCount = new AtomicInteger();
@@ -87,11 +111,6 @@ public final class RegenTask {
     private final AtomicInteger skippedCount = new AtomicInteger();
     private final AtomicInteger excludedCount = new AtomicInteger();
 
-    // Legacy volatile mirrors kept in sync for progress reads during migration-safe access.
-    private volatile int cursor;
-    private volatile int written;
-    private volatile int skipped;
-    private volatile int excluded;
     private final int totalBlocks;
     private volatile boolean done;
     private volatile boolean failed;
@@ -107,7 +126,7 @@ public final class RegenTask {
                      final boolean safeMode,
                      @NotNull final ExclusionIndex exclusions,
                      final boolean deltaSkip,
-                     @Nullable final List<Long> dirtyBlocks,
+                     final long @Nullable [] dirtyBlocks,
                      final int parallelism,
                      @Nullable final Consumer<RegenTask> onComplete,
                      @Nullable final Consumer<Float> onProgress) {
@@ -122,20 +141,12 @@ public final class RegenTask {
         this.safeMode = safeMode;
         this.exclusions = exclusions;
         this.deltaSkip = deltaSkip;
-        if (dirtyBlocks == null || dirtyBlocks.isEmpty()) {
+        if (dirtyBlocks == null || dirtyBlocks.length == 0) {
             this.dirty = null;
         } else {
-            final java.util.ArrayList<Long> sorted = new java.util.ArrayList<>(dirtyBlocks);
-            sorted.sort((a, b) -> {
-                final int ax = ChangeTracker.unpackX(a) >> 4;
-                final int az = ChangeTracker.unpackZ(a) >> 4;
-                final int bx = ChangeTracker.unpackX(b) >> 4;
-                final int bz = ChangeTracker.unpackZ(b) >> 4;
-                if (ax != bx) return Integer.compare(ax, bx);
-                if (az != bz) return Integer.compare(az, bz);
-                return Long.compare(a, b);
-            });
-            this.dirty = sorted.stream().mapToLong(Long::longValue).toArray();
+            final long[] sorted = dirtyBlocks.clone();
+            ChangeTracker.sortByChunk(sorted);
+            this.dirty = sorted;
         }
         this.parallelism = Math.max(1, parallelism);
         this.onComplete = onComplete;
@@ -148,6 +159,9 @@ public final class RegenTask {
         this.palette = snapshot.palette();
         this.airFlags = snapshot.airFlags();
         this.tiles = snapshot.tileEntities();
+        this.tileMask = snapshot.tileMask();
+        this.nmsPalette = new Object[palette.length];
+        this.nmsLevel = FastBlockWriter.nmsEnabled() ? NmsAccess.levelHandle(world) : null;
         this.totalBlocks = snapshot.blockCount();
         this.minChunkX = originX >> 4;
         this.minChunkZ = originZ >> 4;
@@ -156,15 +170,24 @@ public final class RegenTask {
         this.chunksX = maxChunkX - minChunkX + 1;
         this.chunksZ = maxChunkZ - minChunkZ + 1;
         this.totalChunks = chunksX * chunksZ;
+        this.midX = originX + (sizeX >> 1);
+        this.midY = originY + (sizeY >> 1);
+        this.midZ = originZ + (sizeZ >> 1);
+        // Largest |coord - mid| inside the cuboid on each axis. The previous
+        // max(size) bound ran roughly twice as many (empty) wave passes.
+        final int rx = Math.max(midX - originX, originX + sizeX - 1 - midX);
+        final int ry = Math.max(midY - originY, originY + sizeY - 1 - midY);
+        final int rz = Math.max(midZ - originZ, originZ + sizeZ - 1 - midZ);
+        this.maxWaveRadius = Math.max(rx, Math.max(ry, rz));
     }
 
     public boolean isDone() { return done; }
     public boolean isFailed() { return failed; }
 
     public float progress() {
-        if (dirty != null) {
-            if (dirty.length == 0) return 1f;
-            return Math.min(1f, (float) dirtyCursor / (float) dirty.length);
+        final long[] d = dirty;
+        if (d != null) {
+            return Math.min(1f, (float) dirtyCursor / (float) d.length);
         }
         if (totalBlocks == 0) return 1f;
         return Math.min(1f, (float) cursorCount.get() / (float) totalBlocks);
@@ -176,29 +199,82 @@ public final class RegenTask {
     public int blocksExcluded() { return excludedCount.get(); }
     public int totalBlocks() { return totalBlocks; }
 
-    private void bumpCursor() {
-        cursor = cursorCount.incrementAndGet();
+    public void markFailed() {
+        this.failed = true;
+        this.done = true;
+        fireComplete();
     }
 
-    private void bumpWritten() {
-        written = writtenCount.incrementAndGet();
+    public void cancel() {
+        this.cancelled = true;
+        this.done = true;
+        fireComplete();
     }
 
-    private void bumpSkipped() {
-        skipped = skippedCount.incrementAndGet();
+    public boolean isCancelled() {
+        return cancelled;
     }
 
-    private void bumpExcluded() {
-        excluded = excludedCount.incrementAndGet();
-        bumpSkipped();
+    public boolean dirtyMode() {
+        return dirty != null;
     }
 
-    private void scheduleRegion(@NotNull final Location at,
+    private boolean aborted() {
+        return cancelled || failed;
+    }
+
+    private void fireComplete() {
+        if (!completionFired.compareAndSet(false, true)) {
+            return;
+        }
+        if (onComplete == null) {
+            return;
+        }
+        try {
+            onComplete.accept(this);
+        } catch (final Throwable t) {
+            plugin.getSLF4JLogger().error("Regen onComplete handler failed", t);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch dispatch
+    // -----------------------------------------------------------------------
+
+    /**
+     * Apply work until the write budget OR {@code nanoBudget} is used up.
+     * The manager must not call this again until {@code onBatchDone} runs.
+     */
+    public void applyBatch(final int blockBudget, final long nanoBudget,
+                           @NotNull final Runnable onBatchDone) {
+        if (done || aborted()) {
+            onBatchDone.run();
+            return;
+        }
+        if (totalBlocks == 0 || totalChunks <= 0) {
+            finishIfDone();
+            onBatchDone.run();
+            return;
+        }
+        if (dirty != null) {
+            applyDirtyBatch(blockBudget, nanoBudget, onBatchDone);
+            return;
+        }
+        switch (mode) {
+            case LAYER_BY_LAYER -> applyLayerBatch(blockBudget, nanoBudget, onBatchDone);
+            case ANIMATED -> applyWaveBatch(blockBudget, nanoBudget, onBatchDone);
+            case CHUNK_BY_CHUNK -> applyChunkBatch(Math.max(64, blockBudget / 2), nanoBudget, true, onBatchDone);
+            default -> applyChunkBatch(blockBudget, nanoBudget, false, onBatchDone);
+        }
+    }
+
+    /** Run {@code work} on the region owning the chunk, then always release the batch. */
+    private void scheduleRegion(final int chunkX, final int chunkZ,
                                 @NotNull final Runnable work,
                                 @NotNull final Runnable onBatchDone) {
-        scheduler.runAtLocation(at, () -> {
+        scheduler.runAtChunk(world, chunkX, chunkZ, () -> {
             try {
-                if (!cancelled && !failed) {
+                if (!aborted()) {
                     work.run();
                 }
             } catch (final Throwable t) {
@@ -216,141 +292,78 @@ public final class RegenTask {
         });
     }
 
-    public void markFailed() {
-        this.failed = true;
-        this.done = true;
-        fireComplete();
+    private int chunkXAt(final int local) {
+        return minChunkX + (local % chunksX);
     }
 
-    public void cancel() {
-        this.cancelled = true;
-        this.done = true;
-        fireComplete();
+    private int chunkZAt(final int local) {
+        return minChunkZ + (local / chunksX);
     }
 
-    private void fireComplete() {
-        if (!completionFired.compareAndSet(false, true)) {
-            return;
-        }
-        if (onComplete == null) {
-            return;
-        }
-        try {
-            onComplete.accept(this);
-        } catch (final Throwable t) {
-            plugin.getSLF4JLogger().error("Regen onComplete handler failed", t);
-        }
+    private boolean ownsChunk(final int local) {
+        return scheduler.isOwnedByCurrentRegion(world, chunkXAt(local), chunkZAt(local));
     }
 
-    public boolean isCancelled() {
-        return cancelled;
-    }
-
-    public boolean dirtyMode() {
-        return dirty != null;
-    }
-
-    /**
-     * Apply work until {@code blockBudget} writes OR {@code nanoBudget} elapses.
-     * The manager must not call this again until {@code onBatchDone} runs.
-     */
-    public void applyBatch(final int blockBudget, final long nanoBudget,
-                           @NotNull final Runnable onBatchDone) {
-        if (done || cancelled || failed) {
-            onBatchDone.run();
-            return;
-        }
-        if (totalBlocks == 0 || totalChunks <= 0) {
-            finishIfDone();
-            onBatchDone.run();
-            return;
-        }
-        if (dirty != null) {
-            applyDirtyBatch(blockBudget, nanoBudget, onBatchDone);
-            return;
-        }
-
-        if (mode == RegenMode.LAYER_BY_LAYER) {
-            applyLayerBatch(blockBudget, nanoBudget, onBatchDone);
-            return;
-        }
-        if (mode == RegenMode.ANIMATED) {
-            applyWaveBatch(blockBudget, nanoBudget, onBatchDone);
-            return;
-        }
-        applyChunkBatch(blockBudget, nanoBudget, mode == RegenMode.CHUNK_BY_CHUNK, onBatchDone);
-    }
+    // ---- dirty voxels ----
 
     private void applyDirtyBatch(final int blockBudget, final long nanoBudget,
                                  @NotNull final Runnable onBatchDone) {
+        final long[] d = dirty;
         final int start = dirtyCursor;
-        if (start >= dirty.length) {
+        if (d == null || start >= d.length) {
             finishIfDone();
             onBatchDone.run();
             return;
         }
-        // Process only voxels that share the same chunk as dirty[start] so Folia
-        // region ownership is never violated.
-        final int anchorX = ChangeTracker.unpackX(dirty[start]);
-        final int anchorZ = ChangeTracker.unpackZ(dirty[start]);
-        final int chunkX = anchorX >> 4;
-        final int chunkZ = anchorZ >> 4;
-        final Location at = new Location(world, (chunkX << 4) + 8,
-                ChangeTracker.unpackY(dirty[start]), (chunkZ << 4) + 8);
-        scheduleRegion(at, () -> {
-            final long deadline = System.nanoTime() + Math.max(250_000L, nanoBudget);
+        final int chunkX = ChangeTracker.unpackX(d[start]) >> 4;
+        final int chunkZ = ChangeTracker.unpackZ(d[start]) >> 4;
+        scheduleRegion(chunkX, chunkZ, () -> {
+            final Budget b = new Budget(Math.max(64, blockBudget), nanoBudget);
             int i = start;
-            int writes = 0;
-            final int budget = Math.max(64, blockBudget);
-            while (i < dirty.length && writes < budget && System.nanoTime() < deadline
-                    && !cancelled && !failed) {
-                final long packed = dirty[i];
+            int curCx = chunkX;
+            int curCz = chunkZ;
+            while (i < d.length && !aborted()) {
+                final long packed = d[i];
                 final int x = ChangeTracker.unpackX(packed);
                 final int z = ChangeTracker.unpackZ(packed);
-                if ((x >> 4) != chunkX || (z >> 4) != chunkZ) {
+                if ((x >> 4) != curCx || (z >> 4) != curCz) {
+                    // Next chunk: only continue if budget remains and this thread owns it.
+                    if (b.exhausted() || !scheduler.isOwnedByCurrentRegion(world, x >> 4, z >> 4)) {
+                        break;
+                    }
+                    curCx = x >> 4;
+                    curCz = z >> 4;
+                }
+                restorePacked(packed, b);
+                i++;
+                if ((i & 15) == 0 && b.exhausted()) {
+                    // Finish nothing partial: a single voxel is atomic anyway.
                     break;
                 }
-                restorePacked(packed);
-                i++;
-                writes++;
             }
-            if (i == start && i < dirty.length) {
-                i++;
+            if (i == start && i < d.length) {
+                i++; // guarantee forward progress
             }
             dirtyCursor = i;
-            cursor = i;
-            cursorCount.set(i);
+            b.flush();
         }, onBatchDone);
     }
 
-    private void restorePacked(final long packed) {
+    private void restorePacked(final long packed, @NotNull final Budget b) {
         final int x = ChangeTracker.unpackX(packed);
         final int y = ChangeTracker.unpackY(packed);
         final int z = ChangeTracker.unpackZ(packed);
+        b.visited++;
         if (!exclusions.isEmpty() && exclusions.contains(x, y, z)) {
-            bumpExcluded();
+            b.excluded++;
             return;
         }
         final int flat = snapshot.flatIndex(x, y, z, originX, originY, originZ);
         if (flat < 0) return;
-        final int palId = ids[flat];
-        if (palId < 0 || palId >= palette.length) return;
-        final Block block = world.getBlockAt(x, y, z);
-        final byte[] tile = tiles.get(flat);
-        if (deltaSkip && tile == null) {
-            if (airFlags[palId] && block.getType().isAir()) {
-                bumpSkipped();
-                return;
-            }
-            if (block.getBlockData().equals(palette[palId])) {
-                bumpSkipped();
-                return;
-            }
-        }
-        if (!FastBlockWriter.set(world, x, y, z, block, palette[palId])) return;
-        bumpWritten();
-        restoreTile(block, tile, x, y, z);
+        restoreVoxel(world.getBlockAt(x, y, z), flat, x, y, z, b);
     }
+
+    // ---- INSTANT / CHUNK_BY_CHUNK ----
 
     private void applyChunkBatch(final int blockBudget, final long nanoBudget,
                                  final boolean serialChunks,
@@ -361,53 +374,89 @@ public final class RegenTask {
             return;
         }
         final int start = chunkCursor;
-        final int slice = ySlice;
-        final int sliceHeight = serialChunks ? 8 : 16;
-        final int relY1 = Math.min(sizeY - 1, slice + sliceHeight - 1);
         // Cap parallel width under tight budgets so INSTANT cannot spike the tick.
-        int maxParallel = serialChunks
-                ? 1
-                : Math.max(1, Math.min(parallelism, totalChunks - start));
+        int n = serialChunks ? 1 : Math.max(1, Math.min(parallelism, totalChunks - start));
         if (blockBudget < 256 || nanoBudget < 500_000L) {
-            maxParallel = 1;
+            n = 1;
         } else if (blockBudget < 1024 || nanoBudget < 2_000_000L) {
-            maxParallel = Math.min(maxParallel, 2);
+            n = Math.min(n, 2);
         }
-        final int n = maxParallel;
         if (n == 1) {
-            dispatchOneChunk(start, slice, relY1, blockBudget, nanoBudget, false, onBatchDone);
+            dispatchSerialChunks(start, blockBudget, nanoBudget, !serialChunks, onBatchDone);
             return;
         }
-        // Parallel Folia path: finish the requested Y slice fully so shared
-        // ySlice cannot skip unfinished voxels in any of the sibling chunks.
-        final AtomicInteger remaining = new AtomicInteger(n);
-        for (int i = 0; i < n; i++) {
-            final int local = start + i;
-            final int cx = minChunkX + (local % chunksX);
-            final int cz = minChunkZ + (local / chunksX);
-            final Location at = new Location(world, (cx << 4) + 8, originY + slice, (cz << 4) + 8);
-            final Runnable finishSibling = () -> {
-                if (remaining.decrementAndGet() == 0) {
-                    final int nextSlice = relY1 + 1;
-                    if (nextSlice >= sizeY) {
-                        ySlice = 0;
-                        chunkCursor = start + n;
-                    } else {
-                        ySlice = nextSlice;
+        dispatchParallelChunks(start, n, blockBudget, nanoBudget, onBatchDone);
+    }
+
+    /**
+     * Restore from the cursor onwards on one region: resumes the current chunk's
+     * Y position, and (when {@code continueAcross}) moves on to following chunks
+     * that the same region owns while budget remains.
+     */
+    private void dispatchSerialChunks(final int start, final int blockBudget, final long nanoBudget,
+                                      final boolean continueAcross,
+                                      @NotNull final Runnable onBatchDone) {
+        scheduleRegion(chunkXAt(start), chunkZAt(start), () -> {
+            final Budget b = new Budget(blockBudget, nanoBudget);
+            int local = start;
+            int relY = ySlice;
+            try {
+                while (local < totalChunks && !aborted()) {
+                    final int nextY = restoreChunk(chunkXAt(local), chunkZAt(local), relY, sizeY - 1, b, false);
+                    if (nextY < sizeY) {
+                        relY = nextY; // budget ran out mid-chunk
+                        break;
                     }
-                    finishIfDone();
-                    onBatchDone.run();
+                    local++;
+                    relY = 0;
+                    if (!continueAcross || b.exhausted() || local >= totalChunks || !ownsChunk(local)) {
+                        break;
+                    }
                 }
-            };
-            scheduler.runAtLocation(at, () -> {
+            } finally {
+                chunkCursor = local;
+                ySlice = relY;
+                b.flush();
+            }
+        }, onBatchDone);
+    }
+
+    /**
+     * Parallel Folia path: each sibling chunk finishes the same 16-high Y slice so
+     * the shared {@code ySlice} cursor can never skip unfinished voxels.
+     */
+    private void dispatchParallelChunks(final int start, final int n, final int blockBudget, final long nanoBudget,
+                                        @NotNull final Runnable onBatchDone) {
+        final int slice = ySlice;
+        final int relY1 = Math.min(sizeY - 1, slice + 15);
+        final AtomicInteger remaining = new AtomicInteger(n);
+        final Runnable finishSibling = () -> {
+            if (remaining.decrementAndGet() == 0) {
+                final int nextSlice = relY1 + 1;
+                if (nextSlice >= sizeY) {
+                    ySlice = 0;
+                    chunkCursor = start + n;
+                } else {
+                    ySlice = nextSlice;
+                }
+                finishIfDone();
+                onBatchDone.run();
+            }
+        };
+        for (int i = 0; i < n; i++) {
+            final int cx = chunkXAt(start + i);
+            final int cz = chunkZAt(start + i);
+            scheduler.runAtChunk(world, cx, cz, () -> {
+                final Budget b = new Budget(Math.max(64, blockBudget / n), nanoBudget);
                 try {
-                    if (!cancelled && !failed) {
-                        restoreChunk(cx, cz, Math.max(64, blockBudget / n), nanoBudget, slice, relY1, true);
+                    if (!aborted()) {
+                        restoreChunk(cx, cz, slice, relY1, b, true);
                     }
                 } catch (final Throwable t) {
                     plugin.getSLF4JLogger().error("Restore failed in chunk {},{}", cx, cz, t);
                     failed = true;
                 } finally {
+                    b.flush();
                     finishSibling.run();
                 }
             }, () -> {
@@ -417,23 +466,7 @@ public final class RegenTask {
         }
     }
 
-    private void dispatchOneChunk(final int local, final int slice, final int relY1,
-                                  final int blockBudget, final long nanoBudget,
-                                  final boolean mustFinishSlice,
-                                  @NotNull final Runnable onBatchDone) {
-        final int cx = minChunkX + (local % chunksX);
-        final int cz = minChunkZ + (local / chunksX);
-        final Location at = new Location(world, (cx << 4) + 8, originY + slice, (cz << 4) + 8);
-        scheduleRegion(at, () -> {
-            final int nextY = restoreChunk(cx, cz, blockBudget, nanoBudget, slice, relY1, mustFinishSlice);
-            if (nextY >= sizeY) {
-                ySlice = 0;
-                chunkCursor = local + 1;
-            } else {
-                ySlice = nextY;
-            }
-        }, onBatchDone);
-    }
+    // ---- LAYER_BY_LAYER ----
 
     private void applyLayerBatch(final int blockBudget, final long nanoBudget,
                                  @NotNull final Runnable onBatchDone) {
@@ -442,65 +475,201 @@ public final class RegenTask {
             onBatchDone.run();
             return;
         }
-        if (chunkCursor >= totalChunks) {
-            chunkCursor = 0;
-            layerY++;
-            if (layerY >= sizeY) {
-                finishIfDone();
-                onBatchDone.run();
-                return;
+        final int start = chunkCursor;
+        scheduleRegion(chunkXAt(start), chunkZAt(start), () -> {
+            final Budget b = new Budget(Math.max(64, blockBudget), nanoBudget);
+            int local = start;
+            int y = layerY;
+            try {
+                while (y < sizeY && !aborted()) {
+                    restoreChunk(chunkXAt(local), chunkZAt(local), y, y, b, true);
+                    local++;
+                    if (local >= totalChunks) {
+                        local = 0;
+                        y++;
+                    }
+                    if (y >= sizeY || b.exhausted() || !ownsChunk(local)) {
+                        break;
+                    }
+                }
+            } finally {
+                chunkCursor = local;
+                layerY = y;
+                b.flush();
             }
-        }
-        final int y = layerY;
-        final int local = chunkCursor;
-        final int cx = minChunkX + (local % chunksX);
-        final int cz = minChunkZ + (local / chunksX);
-        final Location at = new Location(world, (cx << 4) + 8, originY + y, (cz << 4) + 8);
-        scheduleRegion(at, () -> {
-            restoreChunk(cx, cz, blockBudget, nanoBudget, y, y, true);
-            chunkCursor = local + 1;
         }, onBatchDone);
     }
 
+    // ---- ANIMATED (expanding Chebyshev shell) ----
+
     private void applyWaveBatch(final int blockBudget, final long nanoBudget,
                                 @NotNull final Runnable onBatchDone) {
-        final int maxRadius = Math.max(sizeX, Math.max(sizeY, sizeZ));
-        if (waveRadius > maxRadius) {
+        // Skip chunks the current shell does not touch without dispatching anything.
+        if (!advanceWaveCursor()) {
             finishIfDone();
             onBatchDone.run();
             return;
         }
-        final int radius = waveRadius;
-        if (chunkCursor >= totalChunks) {
-            chunkCursor = 0;
-            waveRadius = radius + 1;
-            if (waveRadius > maxRadius) {
-                finishIfDone();
-                onBatchDone.run();
-                return;
-            }
-        }
-        final int local = chunkCursor;
-        final int cx = minChunkX + (local % chunksX);
-        final int cz = minChunkZ + (local / chunksX);
-        final Location at = new Location(world, (cx << 4) + 8, originY, (cz << 4) + 8);
-        scheduleRegion(at, () -> {
-            if (restoreChunkWave(cx, cz, radius, blockBudget, nanoBudget)) {
-                chunkCursor = local + 1;
+        final int start = chunkCursor;
+        scheduleRegion(chunkXAt(start), chunkZAt(start), () -> {
+            final Budget b = new Budget(Math.max(64, blockBudget), nanoBudget);
+            try {
+                while (!aborted()) {
+                    final int local = chunkCursor;
+                    if (!restoreChunkWave(chunkXAt(local), chunkZAt(local), waveRadius, b)) {
+                        break; // budget exhausted; resume point saved
+                    }
+                    chunkCursor = local + 1;
+                    if (!advanceWaveCursor() || b.exhausted() || !ownsChunk(chunkCursor)) {
+                        break;
+                    }
+                }
+            } finally {
+                b.flush();
             }
         }, onBatchDone);
     }
 
     /**
-     * Restore one chunk Y-slice. Completes each Y row before considering a
-     * budget abort so we never leave a half-written layer. Returns the next
-     * relative Y that still needs work ({@code sizeY} when this chunk is done).
+     * Move the wave cursor to the next chunk that intersects the current shell,
+     * rolling over to the next radius as needed.
+     *
+     * @return false once every radius is done.
+     */
+    private boolean advanceWaveCursor() {
+        while (waveRadius <= maxWaveRadius) {
+            int local = chunkCursor;
+            while (local < totalChunks && !waveTouches(local, waveRadius)) {
+                local++;
+            }
+            if (local < totalChunks) {
+                if (local != chunkCursor) {
+                    chunkCursor = local;
+                    waveResumeY = Integer.MIN_VALUE;
+                }
+                return true;
+            }
+            chunkCursor = 0;
+            waveResumeY = Integer.MIN_VALUE;
+            waveRadius = waveRadius + 1;
+        }
+        return false;
+    }
+
+    private boolean waveTouches(final int local, final int radius) {
+        final int cx = chunkXAt(local);
+        final int cz = chunkZAt(local);
+        final int x0 = Math.max(originX, cx << 4);
+        final int x1 = Math.min(originX + sizeX - 1, (cx << 4) + 15);
+        final int z0 = Math.max(originZ, cz << 4);
+        final int z1 = Math.min(originZ + sizeZ - 1, (cz << 4) + 15);
+        if (x0 > x1 || z0 > z1) return false;
+        final int minDx = (midX >= x0 && midX <= x1) ? 0 : Math.min(Math.abs(x0 - midX), Math.abs(x1 - midX));
+        final int minDz = (midZ >= z0 && midZ <= z1) ? 0 : Math.min(Math.abs(z0 - midZ), Math.abs(z1 - midZ));
+        final int maxDx = Math.max(Math.abs(x0 - midX), Math.abs(x1 - midX));
+        final int maxDz = Math.max(Math.abs(z0 - midZ), Math.abs(z1 - midZ));
+        final int maxDy = Math.max(midY - originY, originY + sizeY - 1 - midY);
+        final int minCheb = Math.max(minDx, minDz);
+        final int maxCheb = Math.max(maxDx, Math.max(maxDz, maxDy));
+        return radius >= minCheb && radius <= maxCheb;
+    }
+
+    /**
+     * Restore the shell {@code cheb == radius} inside one chunk column. Visits
+     * only shell cells (O(shell) instead of O(volume) per radius) and saves a
+     * row-level resume point when the budget runs out, so a partially written
+     * shell is never re-written (the old code restarted the chunk each batch and
+     * could loop forever when delta-skip was off).
+     *
+     * @return true when the chunk's shell is complete.
+     */
+    private boolean restoreChunkWave(final int chunkX, final int chunkZ, final int radius,
+                                     @NotNull final Budget b) {
+        final Chunk chunk = world.getChunkAt(chunkX, chunkZ);
+        final int absX0 = Math.max(originX, chunkX << 4);
+        final int absX1 = Math.min(originX + sizeX - 1, (chunkX << 4) + 15);
+        final int absZ0 = Math.max(originZ, chunkZ << 4);
+        final int absZ1 = Math.min(originZ + sizeZ - 1, (chunkZ << 4) + 15);
+        final int yLo = Math.max(originY, midY - radius);
+        final int yHi = Math.min(originY + sizeY - 1, midY + radius);
+        final int zLo = Math.max(absZ0, midZ - radius);
+        final int zHi = Math.min(absZ1, midZ + radius);
+        final int xLo = Math.max(absX0, midX - radius);
+        final int xHi = Math.min(absX1, midX + radius);
+        if (yLo > yHi || zLo > zHi || xLo > xHi) {
+            waveResumeY = Integer.MIN_VALUE;
+            return true;
+        }
+        int y = yLo;
+        int zStart = zLo;
+        if (waveResumeY != Integer.MIN_VALUE) {
+            y = waveResumeY;
+            zStart = waveResumeZ;
+        }
+        for (; y <= yHi; y++, zStart = zLo) {
+            final int dy = Math.abs(y - midY);
+            final int ry = y - originY;
+            for (int z = zStart; z <= zHi; z++) {
+                if (aborted()) {
+                    waveResumeY = y;
+                    waveResumeZ = z;
+                    return false;
+                }
+                final int dz = Math.abs(z - midZ);
+                final int rowBase = sizeX * ((z - originZ) + sizeZ * ry);
+                if (dy == radius || dz == radius) {
+                    // Whole row of the shell face.
+                    for (int x = xLo; x <= xHi; x++) {
+                        waveVoxel(chunk, x, y, z, rowBase, b);
+                    }
+                } else {
+                    // Interior row: only the two x faces.
+                    final int xa = midX - radius;
+                    final int xb = midX + radius;
+                    if (xa >= xLo && xa <= xHi) waveVoxel(chunk, xa, y, z, rowBase, b);
+                    if (xb != xa && xb >= xLo && xb <= xHi) waveVoxel(chunk, xb, y, z, rowBase, b);
+                }
+                if (b.exhausted()) {
+                    if (z < zHi) {
+                        waveResumeY = y;
+                        waveResumeZ = z + 1;
+                        return false;
+                    }
+                    if (y < yHi) {
+                        waveResumeY = y + 1;
+                        waveResumeZ = zLo;
+                        return false;
+                    }
+                }
+            }
+        }
+        waveResumeY = Integer.MIN_VALUE;
+        return true;
+    }
+
+    private void waveVoxel(@NotNull final Chunk chunk, final int x, final int y, final int z,
+                           final int rowBase, @NotNull final Budget b) {
+        b.visited++;
+        if (!exclusions.isEmpty() && exclusions.contains(x, y, z)) {
+            b.excluded++;
+            return;
+        }
+        restoreVoxel(chunk.getBlock(x & 15, y, z & 15), (x - originX) + rowBase, x, y, z, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Voxel work
+    // -----------------------------------------------------------------------
+
+    /**
+     * Restore relative Y {@code relY0..relY1} of one chunk column. Budget is
+     * checked after each full Y layer so no layer is left half-written.
+     *
+     * @return the next relative Y that still needs work ({@code relY1 + 1} when done).
      */
     private int restoreChunk(final int chunkX, final int chunkZ,
-                             final int blockBudget, final long nanoBudget,
                              final int relY0, final int relY1,
-                             final boolean mustFinishSlice) {
-        final Chunk chunk = world.getChunkAt(chunkX, chunkZ);
+                             @NotNull final Budget b, final boolean mustFinish) {
         final int absX0 = Math.max(originX, chunkX << 4);
         final int absX1 = Math.min(originX + sizeX - 1, (chunkX << 4) + 15);
         final int absZ0 = Math.max(originZ, chunkZ << 4);
@@ -510,172 +679,138 @@ public final class RegenTask {
         if (absX0 > absX1 || absZ0 > absZ1 || absY0 > absY1) {
             return Math.min(sizeY, relY1 + 1);
         }
-
+        final Chunk chunk = world.getChunkAt(chunkX, chunkZ);
         if (safeMode) {
-            liftLiving(absX0, absY0, absZ0, absX1 + 1, absY1 + 1, absZ1 + 1);
+            liftLiving(chunk, absX0, absY0, absZ0, absX1 + 1, absY1 + 1, absZ1 + 1);
         }
-
-        final long deadline = System.nanoTime() + Math.max(250_000L, nanoBudget);
-        int writes = 0;
         final boolean hasExclusions = !exclusions.isEmpty();
-
         for (int y = absY0; y <= absY1; y++) {
-            if (cancelled || failed) {
-                return ryAbort(relY0, y);
-            }
             final int ry = y - originY;
+            if (aborted()) {
+                return ry;
+            }
             for (int z = absZ0; z <= absZ1; z++) {
-                final int rz = z - originZ;
-                final int rowBase = sizeX * (rz + sizeZ * ry);
+                final int rowBase = sizeX * ((z - originZ) + sizeZ * ry);
                 for (int x = absX0; x <= absX1; x++) {
-                    if (cancelled || failed) {
-                        return ry;
-                    }
-                    bumpCursor();
+                    b.visited++;
                     if (hasExclusions && exclusions.contains(x, y, z)) {
-                        bumpExcluded();
+                        b.excluded++;
                         continue;
                     }
-                    final int flat = (x - originX) + rowBase;
-                    if (flat < 0 || flat >= ids.length) {
-                        continue;
-                    }
-                    final int palId = ids[flat];
-                    if (palId < 0 || palId >= palette.length) {
-                        continue;
-                    }
-                    final Block block = chunk.getBlock(x & 15, y, z & 15);
-                    final byte[] tile = tiles.get(flat);
-                    if (deltaSkip && tile == null) {
-                        if (airFlags[palId] && block.getType().isAir()) {
-                            bumpSkipped();
-                            continue;
-                        }
-                        final BlockData current = block.getBlockData();
-                        if (current.equals(palette[palId])) {
-                            bumpSkipped();
-                            continue;
-                        }
-                    }
-                    if (!FastBlockWriter.set(world, x, y, z, block, palette[palId])) {
-                        continue;
-                    }
-                    bumpWritten();
-                    writes++;
-                    restoreTile(block, tile, x, y, z);
+                    restoreVoxel(chunk.getBlock(x & 15, y, z & 15), (x - originX) + rowBase, x, y, z, b);
                 }
             }
-            if (!mustFinishSlice && y < absY1
-                    && System.nanoTime() >= deadline
-                    && writes >= Math.max(32, blockBudget / 4)) {
+            if (!mustFinish && y < absY1 && b.exhausted()) {
                 return ry + 1;
             }
         }
         return relY1 + 1;
     }
 
-    private int ryAbort(final int relY0, final int absY) {
-        return Math.max(relY0, absY - originY);
-    }
-
-    private boolean restoreChunkWave(final int chunkX, final int chunkZ, final int radius,
-                                     final int blockBudget, final long nanoBudget) {
-        final int midX = originX + (sizeX >> 1);
-        final int midY = originY + (sizeY >> 1);
-        final int midZ = originZ + (sizeZ >> 1);
-        final Chunk chunk = world.getChunkAt(chunkX, chunkZ);
-        final int absX0 = Math.max(originX, chunkX << 4);
-        final int absX1 = Math.min(originX + sizeX - 1, (chunkX << 4) + 15);
-        final int absZ0 = Math.max(originZ, chunkZ << 4);
-        final int absZ1 = Math.min(originZ + sizeZ - 1, (chunkZ << 4) + 15);
-        final boolean hasExclusions = !exclusions.isEmpty();
-        final long deadline = System.nanoTime() + Math.max(250_000L, nanoBudget);
-        final int budget = Math.max(64, blockBudget);
-        int writes = 0;
-
-        for (int y = originY; y < originY + sizeY; y++) {
-            final int dy = Math.abs(y - midY);
-            if (dy > radius) continue;
-            final int ry = y - originY;
-            for (int z = absZ0; z <= absZ1; z++) {
-                final int dz = Math.abs(z - midZ);
-                if (dz > radius) continue;
-                final int rz = z - originZ;
-                final int rowBase = sizeX * (rz + sizeZ * ry);
-                for (int x = absX0; x <= absX1; x++) {
-                    final int cheb = Math.max(Math.abs(x - midX), Math.max(dy, dz));
-                    if (cheb != radius) continue;
-                    bumpCursor();
-                    if (hasExclusions && exclusions.contains(x, y, z)) {
-                        bumpExcluded();
-                        continue;
-                    }
-                    final int flat = (x - originX) + rowBase;
-                    if (flat < 0 || flat >= ids.length) continue;
-                    final int palId = ids[flat];
-                    if (palId < 0 || palId >= palette.length) continue;
-                    final Block block = chunk.getBlock(x & 15, y, z & 15);
-                    final byte[] tile = tiles.get(flat);
-                    if (deltaSkip && tile == null) {
-                        if (airFlags[palId] && block.getType().isAir()) {
-                            bumpSkipped();
-                            continue;
-                        }
-                        if (block.getBlockData().equals(palette[palId])) {
-                            bumpSkipped();
-                            continue;
-                        }
-                    }
-                    if (!FastBlockWriter.set(world, x, y, z, block, palette[palId])) {
-                        continue;
-                    }
-                    bumpWritten();
-                    writes++;
-                    restoreTile(block, tile, x, y, z);
-                    if (writes >= budget || System.nanoTime() >= deadline) {
-                        return false;
-                    }
+    private void restoreVoxel(@NotNull final Block block, final int flat,
+                              final int x, final int y, final int z,
+                              @NotNull final Budget b) {
+        if (flat < 0 || flat >= ids.length) {
+            return;
+        }
+        final int palId = ids[flat];
+        if (palId < 0 || palId >= palette.length) {
+            return;
+        }
+        final BitSet mask = tileMask;
+        final byte[] tile = (mask != null && mask.get(flat)) ? tiles.get(flat) : null;
+        final BlockData target = palette[palId];
+        if (deltaSkip && tile == null) {
+            if (airFlags[palId]) {
+                if (block.getType().isAir()) {
+                    b.skipped++;
+                    return;
                 }
+            } else if (block.getBlockData().equals(target)) {
+                b.skipped++;
+                return;
             }
         }
-        return true;
+        Object nms = null;
+        if (nmsLevel != null) {
+            nms = nmsPalette[palId];
+            if (nms == null) {
+                nms = FastBlockWriter.resolveNms(target);
+                nmsPalette[palId] = nms;
+            }
+        }
+        if (!FastBlockWriter.set(nmsLevel, nms, x, y, z, block, target)) {
+            return;
+        }
+        b.written++;
+        if (tile != null) {
+            restoreTile(block, tile, x, y, z);
+        }
     }
 
-    private void liftLiving(final int minX, final int minY, final int minZ,
+    /**
+     * Safe mode: lift living entities standing in the slice being rebuilt.
+     * Only the chunk's own entity list is read (always region-owned on Folia),
+     * and teleports are async (sync {@code teleport} throws on Folia).
+     */
+    private void liftLiving(@NotNull final Chunk chunk,
+                            final int minX, final int minY, final int minZ,
                             final int maxX, final int maxY, final int maxZ) {
         try {
-            final var box = new org.bukkit.util.BoundingBox(minX, minY, minZ, maxX, maxY, maxZ);
-            for (final Entity e : world.getNearbyEntities(box)) {
-                if (e instanceof ItemFrame || e instanceof Painting || e instanceof ArmorStand) {
+            for (final Entity e : chunk.getEntities()) {
+                if (!(e instanceof LivingEntity) || e instanceof ArmorStand) {
                     continue;
                 }
-                if (e instanceof org.bukkit.entity.Player || e instanceof org.bukkit.entity.LivingEntity) {
-                    final Location above = e.getLocation();
-                    above.setY(maxY + 0.2);
-                    e.teleport(above);
+                final Location loc = e.getLocation();
+                if (loc.getX() < minX || loc.getX() >= maxX
+                        || loc.getY() < minY || loc.getY() >= maxY
+                        || loc.getZ() < minZ || loc.getZ() >= maxZ) {
+                    continue;
                 }
+                if (exclusions.contains(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ())) {
+                    continue;
+                }
+                loc.setY(maxY + 0.2);
+                e.teleportAsync(loc);
             }
         } catch (final Throwable t) {
             plugin.getSLF4JLogger().debug("Safe-mode entity lift failed", t);
         }
     }
 
+    private void restoreTile(@NotNull final Block block, final byte @NotNull [] tile,
+                             final int x, final int y, final int z) {
+        try {
+            final BlockState state = block.getState();
+            TileEntitySerializer.restore(state, tile);
+            state.update(true, false);
+        } catch (final Throwable t) {
+            plugin.getSLF4JLogger().warn("Tile restore failed at {},{},{}", x, y, z, t);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion
+    // -----------------------------------------------------------------------
+
+    private boolean blocksComplete() {
+        final long[] d = dirty;
+        if (d != null) {
+            return dirtyCursor >= d.length;
+        }
+        return switch (mode) {
+            case LAYER_BY_LAYER -> layerY >= sizeY;
+            case ANIMATED -> waveRadius > maxWaveRadius;
+            default -> chunkCursor >= totalChunks;
+        };
+    }
+
     private void finishIfDone() {
-        if (failed || cancelled) {
+        if (aborted()) {
             done = true;
             fireComplete();
             return;
         }
-        final boolean complete = dirty != null
-                ? dirtyCursor >= dirty.length
-                : switch (mode) {
-            case LAYER_BY_LAYER -> layerY >= sizeY;
-            case ANIMATED -> {
-                final int maxRadius = Math.max(sizeX, Math.max(sizeY, sizeZ));
-                yield waveRadius > maxRadius;
-            }
-            default -> chunkCursor >= totalChunks;
-        };
         if (onProgress != null) {
             try {
                 onProgress.accept(progress());
@@ -683,31 +818,64 @@ public final class RegenTask {
                 plugin.getSLF4JLogger().debug("Regen onProgress failed", t);
             }
         }
-        if (!complete || done || finishing || completionFired.get()) {
+        if (!blocksComplete() || done || finishing || completionFired.get()) {
             return;
         }
         finishing = true;
-        final Location finishAt = new Location(world, originX, originY, originZ);
-        scheduler.runAtLocation(finishAt, () -> {
+        final Map<Long, List<Snapshot.EntityPayload>> byChunk = groupEntitiesByChunk();
+        restoreEntitiesFrom(0, byChunk);
+    }
+
+    private @NotNull Map<Long, List<Snapshot.EntityPayload>> groupEntitiesByChunk() {
+        final Map<Long, List<Snapshot.EntityPayload>> byChunk = new HashMap<>();
+        for (final Snapshot.EntityPayload ep : snapshot.entities()) {
+            final int bx = (int) Math.floor(ep.x());
+            final int by = (int) Math.floor(ep.y());
+            final int bz = (int) Math.floor(ep.z());
+            if (exclusions.contains(bx, by, bz)) {
+                continue;
+            }
+            byChunk.computeIfAbsent(chunkKey(bx >> 4, bz >> 4), k -> new ArrayList<>()).add(ep);
+        }
+        return byChunk;
+    }
+
+    private static long chunkKey(final int cx, final int cz) {
+        return ((long) cx << 32) | (cz & 0xFFFFFFFFL);
+    }
+
+    /**
+     * Decorative entities are swapped back chunk by chunk on the region that owns
+     * each chunk (Folia forbids touching entities of another region; the old
+     * single whole-arena {@code getNearbyEntities} call ran on one region only).
+     * Consecutive chunks owned by the same region are handled in one task.
+     */
+    private void restoreEntitiesFrom(final int startLocal,
+                                     @NotNull final Map<Long, List<Snapshot.EntityPayload>> byChunk) {
+        if (startLocal >= totalChunks) {
+            completeSuccessfully();
+            return;
+        }
+        scheduler.runAtChunk(world, chunkXAt(startLocal), chunkZAt(startLocal), () -> {
+            int local = startLocal;
             try {
-                if (cancelled || failed) {
+                if (aborted()) {
+                    done = true;
+                    fireComplete();
                     return;
                 }
-                restoreEntities();
+                do {
+                    restoreEntitiesInChunk(chunkXAt(local), chunkZAt(local), byChunk);
+                    local++;
+                } while (local < totalChunks && ownsChunk(local));
             } catch (final Throwable t) {
                 plugin.getSLF4JLogger().error("Entity restore failed during regen finish", t);
                 failed = true;
-            } finally {
                 done = true;
-                if (onProgress != null) {
-                    try {
-                        onProgress.accept(1f);
-                    } catch (final Throwable t) {
-                        plugin.getSLF4JLogger().debug("Regen onProgress(1) failed", t);
-                    }
-                }
                 fireComplete();
+                return;
             }
+            restoreEntitiesFrom(local, byChunk);
         }, () -> {
             plugin.getSLF4JLogger().error("Could not schedule entity restore — aborting regen finish");
             failed = true;
@@ -716,47 +884,84 @@ public final class RegenTask {
         });
     }
 
-    private void restoreEntities() {
-        final int maxX = originX + sizeX;
-        final int maxY = originY + sizeY;
-        final int maxZ = originZ + sizeZ;
+    private void restoreEntitiesInChunk(final int chunkX, final int chunkZ,
+                                        @NotNull final Map<Long, List<Snapshot.EntityPayload>> byChunk) {
+        final List<Snapshot.EntityPayload> payloads = byChunk.get(chunkKey(chunkX, chunkZ));
+        final Chunk chunk = world.getChunkAt(chunkX, chunkZ);
         try {
-            final var box = new org.bukkit.util.BoundingBox(originX, originY, originZ, maxX, maxY, maxZ);
-            for (final Entity e : world.getNearbyEntities(box)) {
+            for (final Entity e : chunk.getEntities()) {
                 if (!(e instanceof ArmorStand || e instanceof ItemFrame
                         || e instanceof Painting || e instanceof Display)) {
                     continue;
                 }
                 final Location loc = e.getLocation();
-                if (exclusions.contains(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ())) {
+                final int bx = loc.getBlockX();
+                final int by = loc.getBlockY();
+                final int bz = loc.getBlockZ();
+                if (bx < originX || bx >= originX + sizeX
+                        || by < originY || by >= originY + sizeY
+                        || bz < originZ || bz >= originZ + sizeZ) {
+                    continue;
+                }
+                if (exclusions.contains(bx, by, bz)) {
                     continue;
                 }
                 e.remove();
             }
         } catch (final Throwable t) {
-            plugin.getSLF4JLogger().warn("Decorative entity cleanup failed", t);
+            plugin.getSLF4JLogger().warn("Decorative entity cleanup failed in chunk {},{}", chunkX, chunkZ, t);
         }
-        for (final Snapshot.EntityPayload ep : snapshot.entities()) {
-            if (exclusions.contains((int) Math.floor(ep.x()), (int) Math.floor(ep.y()), (int) Math.floor(ep.z()))) {
-                continue;
-            }
+        if (payloads == null) {
+            return;
+        }
+        for (final Snapshot.EntityPayload ep : payloads) {
             try {
-                com.dravorax.arenaregendx.snapshot.EntitySerializer.restore(ep, world);
+                EntitySerializer.restore(ep, world);
             } catch (final Throwable t) {
                 plugin.getSLF4JLogger().warn("Entity restore failed for {}", ep.type(), t);
             }
         }
     }
 
-    private void restoreTile(@NotNull final Block block, final byte @Nullable [] tile,
-                             final int x, final int y, final int z) {
-        if (tile == null) return;
-        try {
-            final BlockState state = block.getState();
-            TileEntitySerializer.restore(state, tile);
-            state.update(true, false);
-        } catch (final Throwable t) {
-            plugin.getSLF4JLogger().warn("Tile restore failed at {},{},{}", x, y, z, t);
+    private void completeSuccessfully() {
+        done = true;
+        if (onProgress != null) {
+            try {
+                onProgress.accept(1f);
+            } catch (final Throwable t) {
+                plugin.getSLF4JLogger().debug("Regen onProgress(1) failed", t);
+            }
+        }
+        fireComplete();
+    }
+
+    /**
+     * Per-batch budget + local counters. Counters are folded into the shared
+     * atomics once per batch instead of one atomic RMW per voxel.
+     */
+    private final class Budget {
+        private final int maxWrites;
+        private final long deadline;
+        int visited;
+        int written;
+        int skipped;
+        int excluded;
+
+        Budget(final int maxWrites, final long nanoBudget) {
+            this.maxWrites = Math.max(1, maxWrites);
+            this.deadline = System.nanoTime() + Math.max(250_000L, nanoBudget);
+        }
+
+        boolean exhausted() {
+            return written >= maxWrites || System.nanoTime() >= deadline;
+        }
+
+        void flush() {
+            if (visited != 0) cursorCount.addAndGet(visited);
+            if (written != 0) writtenCount.addAndGet(written);
+            if (skipped + excluded != 0) skippedCount.addAndGet(skipped + excluded);
+            if (excluded != 0) excludedCount.addAndGet(excluded);
+            visited = written = skipped = excluded = 0;
         }
     }
 }

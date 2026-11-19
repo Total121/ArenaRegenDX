@@ -15,9 +15,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.jetbrains.annotations.NotNull;
 
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
 
 /**
@@ -41,7 +39,9 @@ public final class ArenaManagerMenu {
     private static final int SLOT_BACK = 49;
     private static final int SLOT_PAGE = 47;
 
-    private static final SimpleDateFormat DATE_FMT = new SimpleDateFormat("yyyy-MM-dd HH:mm");
+    /** Immutable + thread-safe (SimpleDateFormat is not, and Folia builds GUIs on many threads). */
+    private static final java.time.format.DateTimeFormatter DATE_FMT =
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(java.time.ZoneId.systemDefault());
 
     public static @NotNull Inventory build(@NotNull final GuiManager gm, @NotNull final Player player,
                                            final int page) {
@@ -89,7 +89,7 @@ public final class ArenaManagerMenu {
             default -> GuiHeads.ARENA_READY;
         };
         final String lastRegen = a.lastRegeneratedAt() > 0
-                ? DATE_FMT.format(new Date(a.lastRegeneratedAt()))
+                ? DATE_FMT.format(java.time.Instant.ofEpochMilli(a.lastRegeneratedAt()))
                 : "never";
         return GuiItems.head(hash,
                 ColorUtil.named("<aqua>", a.name()),

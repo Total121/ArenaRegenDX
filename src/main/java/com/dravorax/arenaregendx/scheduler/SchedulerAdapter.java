@@ -103,6 +103,39 @@ public interface SchedulerAdapter {
     @NotNull TaskHandle runAtEntity(@NotNull Entity entity, @NotNull Runnable task);
 
     /**
+     * Like {@link #runAtEntity(Entity, Runnable)} but runs {@code retired} instead
+     * if the entity is removed before the task can execute (Folia). Paper runs the
+     * task on the main thread and never calls {@code retired} unless the plugin
+     * is disabled.
+     */
+    default @NotNull TaskHandle runAtEntity(@NotNull final Entity entity, @NotNull final Runnable task,
+                                            @Nullable final Runnable retired) {
+        return runAtEntity(entity, task);
+    }
+
+    /**
+     * Run a task on the region that owns the given chunk.
+     *
+     * @param world             the world.
+     * @param chunkX            chunk X.
+     * @param chunkZ            chunk Z.
+     * @param task              the task.
+     * @param onScheduleFailure optional callback when the task could not be queued.
+     * @return a handle.
+     */
+    default @NotNull TaskHandle runAtChunk(@NotNull final World world, final int chunkX, final int chunkZ,
+                                           @NotNull final Runnable task,
+                                           @Nullable final Runnable onScheduleFailure) {
+        return runAtLocation(new Location(world, (chunkX << 4) + 8, 0, (chunkZ << 4) + 8), task, onScheduleFailure);
+    }
+
+    /**
+     * @return true if the calling thread may touch the given chunk right now
+     *         (Folia: owning region thread; Paper: main thread).
+     */
+    boolean isOwnedByCurrentRegion(@NotNull World world, int chunkX, int chunkZ);
+
+    /**
      * Run a task on the global region scheduler (Folia) or main thread (Paper).
      * Use sparingly — prefer region-specific scheduling.
      *

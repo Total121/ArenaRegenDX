@@ -71,7 +71,7 @@ public final class ArenaRegenPlaceholderExpansion extends PlaceholderExpansion {
 
     @Override
     public @Nullable String onRequest(@Nullable final OfflinePlayer player, @NotNull final String params) {
-        final String key = params.toLowerCase();
+        final String key = params.toLowerCase(java.util.Locale.ROOT);
         switch (key) {
             case "arenas":
                 return Integer.toString(arenaManager.count());

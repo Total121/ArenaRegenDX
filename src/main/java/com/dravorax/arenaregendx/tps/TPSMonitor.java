@@ -12,7 +12,6 @@ import org.bukkit.Bukkit;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
@@ -50,9 +49,10 @@ public final class TPSMonitor {
     // Last probe fire time.
     private volatile long lastFireNanos = 0L;
 
-    // Cached reflective Bukkit#getTPS() (Paper-only).
-    private volatile Method bukkitGetTPS;
-    private volatile boolean bukkitGetTPSChecked;
+    /** Folia: Bukkit#getTPS() is region-scoped, so the global-region probe is used instead. */
+    private final boolean folia = com.dravorax.arenaregendx.scheduler.SchedulerProvider.isFolia();
+    /** Paper TPS (1m/5m/15m) sampled once per tick by the probe; null until first sample. */
+    private volatile double[] cachedNativeTps;
 
     // Probe task handle.
     private volatile TaskHandle probeTask;
@@ -102,6 +102,18 @@ public final class TPSMonitor {
         final long now = System.nanoTime();
         final long last = lastFireNanos;
         lastFireNanos = now;
+        if (!folia) {
+            // One cheap read per tick on the main thread instead of a reflective
+            // call (and possible exception) every time a budget is computed.
+            try {
+                final double[] tps = Bukkit.getTPS();
+                if (tps != null && tps.length >= 3) {
+                    cachedNativeTps = tps;
+                }
+            } catch (final Throwable ignored) {
+                // fall back to the derived value
+            }
+        }
         if (last == 0L) {
             return; // first fire, no interval yet
         }
@@ -264,26 +276,7 @@ public final class TPSMonitor {
     }
 
     private @Nullable double[] nativeTPS() {
-        if (!bukkitGetTPSChecked) {
-            try {
-                bukkitGetTPS = Bukkit.class.getMethod("getTPS");
-            } catch (final NoSuchMethodException ignored) {
-                bukkitGetTPS = null;
-            }
-            bukkitGetTPSChecked = true;
-        }
-        if (bukkitGetTPS == null) {
-            return null;
-        }
-        try {
-            final Object result = bukkitGetTPS.invoke(Bukkit.getServer());
-            if (result instanceof double[] arr && arr.length >= 3) {
-                return arr;
-            }
-        } catch (final Throwable ignored) {
-            // ignore — fall back to derived
-        }
-        return null;
+        return folia ? null : cachedNativeTps;
     }
 
     private static double clamp(final double v) {

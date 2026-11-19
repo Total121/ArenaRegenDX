@@ -15,7 +15,6 @@ import java.io.File;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -49,15 +48,16 @@ public final class ConfigManager {
     };
 
     private final ArenaRegenDXPlugin plugin;
-    private final Map<String, FileConfiguration> configs = new HashMap<>();
+    /** Read from region/async threads on Folia; reload swaps entries atomically. */
+    private final Map<String, FileConfiguration> configs = new java.util.concurrent.ConcurrentHashMap<>();
 
     // Typed settings holders (recomputed on reload).
-    private Settings.GeneralSettings general;
-    private Settings.PerformanceSettings performance;
-    private Settings.StorageSettings storage;
-    private Settings.ParticleSettings particles;
-    private Settings.SoundSettings sounds;
-    private Settings.GuiSettings gui;
+    private volatile Settings.GeneralSettings general;
+    private volatile Settings.PerformanceSettings performance;
+    private volatile Settings.StorageSettings storage;
+    private volatile Settings.ParticleSettings particles;
+    private volatile Settings.SoundSettings sounds;
+    private volatile Settings.GuiSettings gui;
 
     public ConfigManager(@NotNull final ArenaRegenDXPlugin plugin) {
         this.plugin = plugin;
@@ -79,7 +79,7 @@ public final class ConfigManager {
      * Arena metadata is owned by {@link com.dravorax.arenaregendx.arena.ArenaManager}
      * and must not race with in-flight {@code saveArena} writes.
      */
-    public void reload() {
+    public synchronized void reload() {
         final FileConfiguration arenas = configs.get("arenas.yml");
         for (final String name : FILES) {
             if ("arenas.yml".equals(name)) {
@@ -108,8 +108,19 @@ public final class ConfigManager {
      * Save the arenas.yml file (used by ArenaManager).
      */
     public void saveArenas(@NotNull final FileConfiguration arenasConfig) {
+        // Write to a temp file and move it into place: a crash or full disk
+        // mid-write must never truncate the only copy of every arena definition.
+        final java.nio.file.Path target = file("arenas.yml").toPath();
+        final java.nio.file.Path tmp = target.resolveSibling("arenas.yml.tmp");
         try {
-            arenasConfig.save(file("arenas.yml"));
+            final String data = arenasConfig.saveToString();
+            java.nio.file.Files.writeString(tmp, data, StandardCharsets.UTF_8);
+            try {
+                java.nio.file.Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (final java.nio.file.AtomicMoveNotSupportedException e) {
+                java.nio.file.Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (final java.io.IOException e) {
             plugin.getSLF4JLogger().error("Could not save arenas.yml", e);
         }
@@ -167,7 +178,7 @@ public final class ConfigManager {
         this.performance = Settings.PerformanceSettings.from(config("performance.yml"));
     }
 
-    private void setAndSave(@NotNull final String fileName, @NotNull final String path, @NotNull final Object value) {
+    private synchronized void setAndSave(@NotNull final String fileName, @NotNull final String path, @NotNull final Object value) {
         final FileConfiguration c = configs.get(fileName);
         if (c == null) return;
         c.set(path, value);

@@ -55,12 +55,22 @@ public final class SelectionWandListener implements Listener {
 
     @EventHandler(priority = EventPriority.LOW, ignoreCancelled = false)
     public void onInteract(@NotNull final PlayerInteractEvent event) {
+        // The event fires once per hand; only the main hand holds the wand.
+        // Without this, every right click set pos2 twice (double message/sound).
+        if (event.getHand() != org.bukkit.inventory.EquipmentSlot.HAND) {
+            return;
+        }
         final Player player = event.getPlayer();
         final ItemStack item = player.getInventory().getItemInMainHand();
-        if (!isWand(item)) {
+        if (item.getType() != Material.GOLDEN_AXE || !isWand(item)) {
             return;
         }
         if (!configManager.general().wandEnabled) {
+            return;
+        }
+        // A renamed golden axe also matches the legacy name check; gate on the
+        // same permission that hands out the wand.
+        if (!player.hasPermission("arenaregendx.wand") && !player.hasPermission("arenaregendx.admin")) {
             return;
         }
         final Action action = event.getAction();

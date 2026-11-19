@@ -299,6 +299,55 @@ public final class ArenaManager {
     }
 
     /**
+     * Capture a fresh snapshot of an arena and make it the arena's restore point.
+     * Single code path for the command, the GUI and the public API: sets
+     * {@code SAVING}, records the new snapshot id, persists, prunes old files.
+     *
+     * @return a future completed with the metadata once the file is written.
+     */
+    public @NotNull CompletableFuture<SnapshotMetadata> captureSnapshot(@NotNull final Arena arena) {
+        if (arenas.get(arena.name()) != arena) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("Arena not found: " + arena.name()));
+        }
+        if (arena.status() == ArenaStatus.SAVING || arena.status() == ArenaStatus.REGENERATING
+                || plugin.regenManager().isRegenerating(arena.name())) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Arena is busy (saving or regenerating): " + arena.name()));
+        }
+        final World world = Bukkit.getWorld(arena.worldName());
+        if (world == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException("World not loaded: " + arena.worldName()));
+        }
+        final Location min = new Location(world, arena.originX(), arena.originY(), arena.originZ());
+        final Location max = new Location(world,
+                arena.originX() + arena.sizeX() - 1,
+                arena.originY() + arena.sizeY() - 1,
+                arena.originZ() + arena.sizeZ() - 1);
+        arena.setStatus(ArenaStatus.SAVING);
+        final CompletableFuture<SnapshotMetadata> future;
+        try {
+            future = snapshotManager.saveSnapshot(arena.name(), world, min, max);
+        } catch (final Throwable t) {
+            arena.setStatus(arena.latestSnapshotId() > 0 ? ArenaStatus.READY : ArenaStatus.EMPTY);
+            return CompletableFuture.failedFuture(t);
+        }
+        return future.whenComplete((meta, err) -> {
+            if (arenas.get(arena.name()) != arena) {
+                return; // deleted or renamed meanwhile — never resurrect it
+            }
+            if (err == null && meta != null) {
+                arena.onSnapshotSaved(meta.snapshotId());
+                arena.setStatus(ArenaStatus.READY);
+                saveArena(arena);
+                snapshotManager.pruneOldSnapshots(arena.name());
+            } else {
+                arena.setStatus(ArenaStatus.ERROR);
+                plugin.getSLF4JLogger().error("Snapshot save failed for {}", arena.name(), err);
+            }
+        });
+    }
+
+    /**
      * Synchronous in-memory lookup.
      */
     public @Nullable Arena getArena(@NotNull final String name) {

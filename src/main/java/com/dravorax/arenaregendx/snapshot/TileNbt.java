@@ -46,14 +46,8 @@ public final class TileNbt {
         if (!isNbt(payload)) return false;
         final byte[] nbt = new byte[payload.length - MAGIC.length];
         System.arraycopy(payload, MAGIC.length, nbt, 0, nbt.length);
-        if (!NmsAccess.restoreTileNbt(state, nbt)) {
-            return false;
-        }
-        try {
-            state.update(true, false);
-            return true;
-        } catch (final Throwable t) {
-            return false;
-        }
+        // The caller applies the state once (state.update) after restore; updating
+        // here as well wrote every tile entity twice.
+        return NmsAccess.restoreTileNbt(state, nbt);
     }
 }

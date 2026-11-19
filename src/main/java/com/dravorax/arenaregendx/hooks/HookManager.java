@@ -33,6 +33,8 @@ public final class HookManager {
     private final SchedulerAdapter scheduler;
 
     private boolean papiEnabled;
+    /** Held so it can be unregistered: persist() keeps it alive past our disable otherwise. */
+    private Object papiExpansion;
     private boolean worldEditEnabled;
     private boolean worldGuardEnabled;
 
@@ -61,7 +63,16 @@ public final class HookManager {
      * Disable all hooks (unregister expansions, etc.).
      */
     public void disableAll() {
-        // PlaceholderAPI expansions are auto-unregistered on plugin disable.
+        // A persistent expansion survives our disable and would pin this plugin
+        // instance (and every manager it references) in memory across reloads.
+        if (papiExpansion != null) {
+            try {
+                ((com.dravorax.arenaregendx.hooks.papi.ArenaRegenPlaceholderExpansion) papiExpansion).unregister();
+            } catch (final Throwable t) {
+                plugin.getSLF4JLogger().debug("PlaceholderAPI unregister failed", t);
+            }
+            papiExpansion = null;
+        }
         // WorldEdit / WorldGuard don't require explicit teardown.
     }
 
@@ -93,8 +104,11 @@ public final class HookManager {
 
     private void enablePapi() {
         // Class loaded only here — safe if PAPI is absent (this method is never called).
-        new com.dravorax.arenaregendx.hooks.papi.ArenaRegenPlaceholderExpansion(plugin, arenaManager, regenManager, tpsMonitor)
-                .register();
+        final var expansion = new com.dravorax.arenaregendx.hooks.papi.ArenaRegenPlaceholderExpansion(
+                plugin, arenaManager, regenManager, tpsMonitor);
+        if (expansion.register()) {
+            papiExpansion = expansion;
+        }
     }
 
     private void enableWorldEdit() {
