@@ -11,7 +11,6 @@ import com.dravorax.arenaregendx.arena.ArenaSelectionManager;
 import com.dravorax.arenaregendx.config.ConfigManager;
 import com.dravorax.arenaregendx.config.Settings;
 import com.dravorax.arenaregendx.util.ColorUtil;
-import net.kyori.adventure.text.Component;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Sound;
@@ -22,6 +21,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
@@ -53,14 +53,18 @@ public final class SelectionWandListener implements Listener {
         this.wandKey = new NamespacedKey(plugin, WAND_KEY_NAME);
     }
 
-    @EventHandler(priority = EventPriority.LOW, ignoreCancelled = false)
+    @EventHandler(priority = EventPriority.LOW)
     public void onInteract(@NotNull final PlayerInteractEvent event) {
-        final Player player = event.getPlayer();
-        final ItemStack item = player.getInventory().getItemInMainHand();
-        if (!isWand(item)) {
+        // The event fires once per hand; only the main hand holds the wand.
+        if (event.getHand() != EquipmentSlot.HAND) {
             return;
         }
-        if (!configManager.general().wandEnabled) {
+        final Player player = event.getPlayer();
+        final ItemStack item = player.getInventory().getItemInMainHand();
+        if (!isWand(item) || !configManager.general().wandEnabled) {
+            return;
+        }
+        if (!player.hasPermission("arenaregendx.wand") && !player.hasPermission("arenaregendx.admin")) {
             return;
         }
         final Action action = event.getAction();
@@ -79,24 +83,27 @@ public final class SelectionWandListener implements Listener {
 
         final Settings.SoundSettings sounds = configManager.sounds();
         final boolean pos1 = action == Action.LEFT_CLICK_BLOCK || action == Action.LEFT_CLICK_AIR;
+        final var messages = plugin.messages();
         if (pos1) {
             selectionManager.setPos1(player, clicked.getLocation());
-            player.sendActionBar(ColorUtil.mini("<green>Pos 1 <dark_gray>» <yellow>"
-                    + clicked.getX() + ", " + clicked.getY() + ", " + clicked.getZ()));
+            messages.actionBar(player, "selection.pos1", "x", clicked.getX(), "y", clicked.getY(), "z", clicked.getZ());
             playSound(player, sounds.selectPos1);
         } else {
             selectionManager.setPos2(player, clicked.getLocation());
-            player.sendActionBar(ColorUtil.mini("<aqua>Pos 2 <dark_gray>» <yellow>"
-                    + clicked.getX() + ", " + clicked.getY() + ", " + clicked.getZ()));
+            messages.actionBar(player, "selection.pos2", "x", clicked.getX(), "y", clicked.getY(), "z", clicked.getZ());
             playSound(player, sounds.selectPos2);
         }
         final var sel = selectionManager.getSelection(player);
-        if (sel != null && sel.isComplete() && sel.min() != null && sel.max() != null) {
-            final int dx = sel.max().getBlockX() - sel.min().getBlockX() + 1;
-            final int dy = sel.max().getBlockY() - sel.min().getBlockY() + 1;
-            final int dz = sel.max().getBlockZ() - sel.min().getBlockZ() + 1;
-            player.sendMessage(ColorUtil.mini("<dark_gray>» <gold>Selection <yellow>"
-                    + dx + "x" + dy + "x" + dz + " <gray>(" + ((long) dx * dy * dz) + " blocks)"));
+        if (sel != null && sel.isComplete()) {
+            final var min = sel.min();
+            final var max = sel.max();
+            if (min != null && max != null) {
+                final int dx = max.getBlockX() - min.getBlockX() + 1;
+                final int dy = max.getBlockY() - min.getBlockY() + 1;
+                final int dz = max.getBlockZ() - min.getBlockZ() + 1;
+                messages.send(player, "selection.size", "size", dx + "x" + dy + "x" + dz,
+                        "blocks", (long) dx * dy * dz);
+            }
         }
     }
 
@@ -115,8 +122,8 @@ public final class SelectionWandListener implements Listener {
         if (!meta.hasDisplayName() || meta.displayName() == null) {
             return false;
         }
-        final String plain = ColorUtil.plain(ColorUtil.legacy(meta.displayName()));
-        return plain.contains("ArenaRegenDX") && plain.toLowerCase().contains("wand");
+        final String plain = ColorUtil.plain(ColorUtil.legacy(meta.displayName())).toLowerCase(java.util.Locale.ROOT).replace(" ", "");
+        return plain.contains("arenaregendx") && plain.contains("wand");
     }
 
     private void playSound(@NotNull final Player player, @NotNull final String soundName) {
@@ -152,7 +159,4 @@ public final class SelectionWandListener implements Listener {
         }
         return wand;
     }
-
-    @SuppressWarnings("unused")
-    private static final Class<Component> UNUSED = Component.class;
 }

@@ -1,32 +1,24 @@
 # ============================================================================
-# ArenaRegenDX — Snapshot storage configuration
+# ArenaRegenDX — Snapshot storage
 # ============================================================================
-# Controls how arena snapshots are serialised, compressed and written to disk.
+# Snapshots live in plugins/ArenaRegenDX/snapshots/<arena>/<id>.ardx and are
+# written to a temporary file first, then moved into place atomically.
 
-# Compression algorithm. One of: NONE | GZIP | ZLIB
-#   NONE  — fastest, largest files (use only for debugging).
-#   GZIP  — good ratio, slightly slower than ZLIB.
-#   ZLIB  — best balance (default). Uses java.util.zip.Deflater.
+# Compression algorithm: NONE | GZIP | ZLIB
+#   NONE — fastest, largest files (debugging only)
+#   GZIP — good ratio
+#   ZLIB — best balance (default)
 compression: ZLIB
 
-# Deflater compression level (0..9, or -1 for default).
-#   0  = no compression (fastest write, largest file)
-#   1  = best speed
-#   6  = default balance
-#   9  = best compression (slowest write, smallest file)
+# Deflater level for GZIP and ZLIB (0..9, or -1 for the library default).
+#   1 = fastest   6 = balanced   9 = smallest files
 compression-level: 6
 
-# Delta storage: when saving a new snapshot that differs only slightly from the
-# previous one, store only the changed blocks. Reduces disk usage and write time
-# for incremental saves. (Currently informational — full snapshots are written.)
-delta-storage: true
-
-# Maximum number of snapshots retained per arena. Older snapshots are pruned
-# automatically after each save.
+# Snapshots kept per arena. Older ones are pruned after each save; the
+# snapshot an arena currently restores from is never pruned.
 max-snapshots-per-arena: 10
 
-# Write snapshots to disk on a background thread (never blocks the server thread).
-async-disk-write: true
-
-# Size of the per-write byte buffer (bytes). Larger = fewer syscalls for big files.
-write-buffer-size: 65536
+# Memory budget (MB) for decoded snapshots kept in RAM so repeated restores do
+# not re-read the disk. Least recently used snapshots are evicted first.
+# Typical arenas use 1 byte per block (4 for arenas with >65k block types).
+cache-memory-mb: 256

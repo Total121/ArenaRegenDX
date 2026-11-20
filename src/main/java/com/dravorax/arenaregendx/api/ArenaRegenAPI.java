@@ -1,6 +1,6 @@
 /*
  * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * Copyright (C) 2026 DravoraX. All rights reserved.
  */
 
 package com.dravorax.arenaregendx.api;
@@ -38,22 +38,20 @@ import java.util.concurrent.CompletableFuture;
  *     return;
  * }
  *
- * // 2. Create an arena from two corners.
- * api.createArena("duel1", world, pos1, pos2).thenAccept(arena -> {
- *     // 3. Capture a snapshot.
- *     return api.saveSnapshot("duel1");
- * }).thenCompose(meta -> {
- *     // 4. Regenerate it later (e.g., after a match).
- *     return api.regen("duel1", RegenMode.LAYER_BY_LAYER, true);
- * });
+ * // 2. Create an arena from two corners, then capture its snapshot.
+ * api.createArena("duel1", world, pos1, pos2)
+ *    .thenCompose(arena -> api.saveSnapshot("duel1"))
+ *    .thenAccept(meta -> getLogger().info("duel1 saved as #" + meta.snapshotId()));
+ *
+ * // 3. After a match, restore it.
+ * api.regen("duel1", RegenMode.INSTANT, true)
+ *    .thenAccept(task -> getLogger().info(task.blocksApplied() + " blocks restored"));
  * }</pre>
  *
  * <h2>Thread safety</h2>
- * <p>All methods return {@link CompletableFuture}s and never block the caller.
- * Futures complete on the plugin's async pools; the {@code thenAccept} callback
- * runs on whichever thread last touched the future. Use
- * {@link CompletableFuture#thenAcceptAsync} with a known executor if you need
- * a specific thread.</p>
+ * <p>Methods never block the caller. Futures complete on plugin worker or
+ * region threads; schedule your own follow-up work onto the thread you need
+ * (for example with the Bukkit / Folia schedulers) before touching the world.</p>
  *
  * @author DravoraX
  * @since 1.0.0
@@ -92,8 +90,11 @@ public final class ArenaRegenAPI {
                                                          @NotNull final World world,
                                                          @NotNull final Location pos1,
                                                          @NotNull final Location pos2) {
-        return CompletableFuture.supplyAsync(() ->
-                arenaManager().createArena(name, world, pos1, pos2, 0, true));
+        try {
+            return CompletableFuture.completedFuture(arenaManager().createArena(name, world, pos1, pos2, 0, true));
+        } catch (final RuntimeException e) {
+            return CompletableFuture.failedFuture(e);
+        }
     }
 
     /**
@@ -103,7 +104,7 @@ public final class ArenaRegenAPI {
      * @return a future completed with true if the arena existed.
      */
     public @NotNull CompletableFuture<Boolean> deleteArena(@NotNull final String name) {
-        return CompletableFuture.supplyAsync(() -> arenaManager().deleteArena(name));
+        return CompletableFuture.completedFuture(arenaManager().deleteArena(name));
     }
 
     /**
@@ -126,26 +127,17 @@ public final class ArenaRegenAPI {
     // -----------------------------------------------------------------------
 
     /**
-     * Save a fresh snapshot of an arena.
+     * Capture a fresh snapshot of an arena and make it the restore point.
      *
      * @param arenaName the arena name.
-     * @return a future completed with the snapshot metadata.
+     * @return a future completed with the snapshot metadata once it is on disk.
      */
     public @NotNull CompletableFuture<SnapshotMetadata> saveSnapshot(@NotNull final String arenaName) {
         final Arena arena = arenaManager().getArena(arenaName);
         if (arena == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("Arena not found: " + arenaName));
         }
-        final World world = org.bukkit.Bukkit.getWorld(arena.worldName());
-        if (world == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException("World not loaded: " + arena.worldName()));
-        }
-        final Location min = new Location(world, arena.originX(), arena.originY(), arena.originZ());
-        final Location max = new Location(world,
-                arena.originX() + arena.sizeX() - 1,
-                arena.originY() + arena.sizeY() - 1,
-                arena.originZ() + arena.sizeZ() - 1);
-        return snapshotManager().saveSnapshot(arenaName, world, min, max);
+        return arenaManager().captureSnapshot(arena);
     }
 
     /**
@@ -178,10 +170,30 @@ public final class ArenaRegenAPI {
     }
 
     /**
+     * Restore only the voxels changed since the last restore when dirty tracking
+     * trusts its record, otherwise the full snapshot (what auto-reset uses).
+     */
+    public @NotNull CompletableFuture<RegenTask> regenChanged(@NotNull final String arenaName,
+                                                              @NotNull final RegenMode mode,
+                                                              final boolean safeMode) {
+        return regenManager().regen(arenaName, mode, safeMode, true);
+    }
+
+    /** Cancel a queued or running restore. @return true if something was cancelled. */
+    public boolean cancelRegen(@NotNull final String arenaName) {
+        return regenManager().cancel(arenaName);
+    }
+
+    /**
      * @return true if a regeneration is currently running.
      */
     public boolean isRegenerating() {
         return regenManager().isRegenerating();
+    }
+
+    /** @return true if this arena is being restored or queued. */
+    public boolean isRegenerating(@NotNull final String arenaName) {
+        return regenManager().isRegenerating(arenaName);
     }
 
     /**
@@ -201,7 +213,7 @@ public final class ArenaRegenAPI {
             return false;
         }
         arena.addExclusion(zone);
-        arenaManager().saveArena(arena);
+        arenaManager().onExclusionsChanged(arena);
         return true;
     }
 
@@ -215,7 +227,7 @@ public final class ArenaRegenAPI {
         }
         final boolean removed = arena.removeExclusion(zoneName);
         if (removed) {
-            arenaManager().saveArena(arena);
+            arenaManager().onExclusionsChanged(arena);
         }
         return removed;
     }

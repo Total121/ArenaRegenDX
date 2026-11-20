@@ -1,6 +1,7 @@
 /*
- * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * ArenaRegenDX - High-performance arena regeneration
+ * Copyright (C) 2026 DravoraX. All rights reserved.
+ * Licensed exclusively to DravoraX.
  */
 
 package com.dravorax.arenaregendx.regen;
@@ -9,48 +10,38 @@ import com.dravorax.arenaregendx.ArenaRegenDXPlugin;
 import com.dravorax.arenaregendx.arena.Arena;
 import com.dravorax.arenaregendx.arena.ArenaManager;
 import com.dravorax.arenaregendx.scheduler.SchedulerAdapter;
-import com.dravorax.arenaregendx.util.ColorUtil;
-import net.kyori.adventure.text.Component;
-import org.bukkit.Bukkit;
+import com.dravorax.arenaregendx.scheduler.TaskHandle;
+import com.dravorax.arenaregendx.util.Messages;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 /**
- * Manages per-arena auto-reset countdown timers.
+ * Per-arena auto-reset countdown timers.
  *
- * <p>Each arena with {@code autoResetInterval > 0} gets a countdown. At key
- * thresholds (10 min, 5 min, 1 min, 30 sec, 5-1 sec) a broadcast message is
- * sent to all players in the arena. At zero, regeneration is triggered.</p>
- *
- * <p>The countdown is driven by a single 1-second repeating task. Each tick
- * decrements the remaining time for every arena that has an active timer.</p>
+ * <p>Arenas with {@code auto-reset > 0} get a countdown driven by one 1-second
+ * global task. Players inside the arena are warned at 10 min, 5 min, 1 min,
+ * 30 s and 5..1 s; at zero the arena is restored (only changed voxels when
+ * dirty tracking trusts its record) and the countdown restarts once the
+ * restore finishes.</p>
  *
  * @author DravoraX
  * @since 1.0.0
  */
 public final class AutoResetManager {
 
+    private static final long[] BROADCAST_THRESHOLDS = {600, 300, 60, 30, 5, 4, 3, 2, 1};
+
     private final ArenaRegenDXPlugin plugin;
     private final ArenaManager arenaManager;
     private final RegenManager regenManager;
     private final SchedulerAdapter scheduler;
 
-    /** Per-arena remaining seconds until reset. */
-    private final ConcurrentMap<String, Long> countdowns = new ConcurrentHashMap<>();
-
-    /** The repeating driver task. */
-    private com.dravorax.arenaregendx.scheduler.TaskHandle driver;
-
-    /** Broadcast thresholds (in seconds), descending. */
-    private static final long[] BROADCAST_THRESHOLDS = {
-            600,  // 10 min
-            300,  // 5 min
-            60,   // 1 min
-            30,   // 30 sec
-            5, 4, 3, 2, 1
-    };
+    /** Remaining seconds keyed by lowercase arena name. Value 0 = restore in progress. */
+    private final Map<String, Long> countdowns = new ConcurrentHashMap<>();
+    private TaskHandle driver;
 
     public AutoResetManager(@NotNull final ArenaRegenDXPlugin plugin,
                             @NotNull final ArenaManager arenaManager,
@@ -62,152 +53,107 @@ public final class AutoResetManager {
         this.scheduler = scheduler;
     }
 
-    /**
-     * Start the countdown driver (1-second repeating task on the global region).
-     */
+    /** Start the 1-second driver on the global region. */
     public void start() {
         if (driver != null) return;
-        // Global region — broadcasts touch players and must not run on async.
         driver = scheduler.runGlobalRepeating(this::tick, 20L, 20L);
-        plugin.getSLF4JLogger().info("Auto-reset timer driver started.");
     }
 
-    /**
-     * Per-second tick: decrement all countdowns, broadcast at thresholds, trigger regen at zero.
-     */
     private void tick() {
         if (countdowns.isEmpty()) return;
-        for (final var entry : countdowns.entrySet()) {
-            final String arenaName = entry.getKey();
-            long remaining = entry.getValue();
-            if (remaining <= 0) {
+        for (final Map.Entry<String, Long> entry : countdowns.entrySet()) {
+            final long current = entry.getValue();
+            if (current <= 0) {
+                continue; // restore in flight
+            }
+            final long remaining = current - 1;
+            // Only update if nobody restarted / stopped the timer concurrently.
+            if (!countdowns.replace(entry.getKey(), current, remaining)) {
                 continue;
             }
-            remaining--;
-            countdowns.put(arenaName, remaining);
-
-            // Check if we hit a broadcast threshold.
             for (final long threshold : BROADCAST_THRESHOLDS) {
                 if (remaining == threshold) {
-                    broadcastCountdown(arenaName, threshold);
+                    broadcastCountdown(entry.getKey(), threshold);
                     break;
                 }
             }
-
-            // At zero, trigger regeneration and reset the timer.
             if (remaining <= 0) {
-                triggerAutoRegen(arenaName);
+                triggerAutoRegen(entry.getKey());
             }
         }
     }
 
-    /**
-     * Start or restart the countdown for an arena.
-     *
-     * @param arena the arena.
-     */
+    /** Start or restart the countdown for an arena (no-op if auto-reset is off). */
     public void startCountdown(@NotNull final Arena arena) {
         if (arena.autoResetInterval() > 0) {
-            countdowns.put(arena.name(), (long) arena.autoResetInterval());
-            plugin.getSLF4JLogger().info("Auto-reset timer started for '{}' ({} sec).",
-                    arena.name(), arena.autoResetInterval());
+            countdowns.put(key(arena.name()), (long) arena.autoResetInterval());
+        } else {
+            countdowns.remove(key(arena.name()));
         }
     }
 
-    /**
-     * Stop the countdown for an arena.
-     *
-     * @param arenaName the arena name.
-     */
+    /** Stop the countdown for an arena. */
     public void stopCountdown(@NotNull final String arenaName) {
-        countdowns.remove(arenaName);
+        countdowns.remove(key(arenaName));
     }
 
-    /**
-     * Get remaining seconds until auto-reset.
-     *
-     * @param arenaName the arena name.
-     * @return remaining seconds, or -1 if no active countdown.
-     */
+    /** @return remaining seconds, 0 while restoring, or -1 if no countdown is active. */
     public long getRemaining(@NotNull final String arenaName) {
-        return countdowns.getOrDefault(arenaName, -1L);
+        return countdowns.getOrDefault(key(arenaName), -1L);
     }
 
-    /**
-     * Broadcast a countdown message to all players in the arena.
-     */
-    private void broadcastCountdown(@NotNull final String arenaName, final long seconds) {
-        final Arena arena = arenaManager.getArena(arenaName);
+    private void broadcastCountdown(@NotNull final String key, final long seconds) {
+        final Arena arena = arenaManager.getArena(key);
         if (arena == null) return;
-        final String timeStr = formatTime(seconds);
-        final Component msg = ColorUtil.mini(
-                "<gold>⚠ <yellow>" + arenaName + " <gold>will be reset in <red>" + timeStr + "<gold>!");
+        final String time = formatTime(seconds);
+        final Messages messages = plugin.messages();
         arenaManager.forEachPlayerInArena(arena, player -> {
-            player.sendMessage(msg);
-            player.sendActionBar(ColorUtil.mini("<red>" + timeStr + " <dark_gray>until reset"));
+            messages.send(player, "auto-reset.warning", "arena", arena.name(), "time", time);
+            messages.actionBar(player, "auto-reset.action-bar", "arena", arena.name(), "time", time);
         });
-        plugin.getSLF4JLogger().info("[AutoReset] {} will reset in {}.", arenaName, timeStr);
     }
 
-    /**
-     * Trigger auto-regeneration and reset the countdown.
-     */
-    private void triggerAutoRegen(@NotNull final String arenaName) {
-        final Arena arena = arenaManager.getArena(arenaName);
-        if (arena == null) {
-            countdowns.remove(arenaName);
+    private void triggerAutoRegen(@NotNull final String key) {
+        final Arena arena = arenaManager.getArena(key);
+        if (arena == null || arena.autoResetInterval() <= 0) {
+            countdowns.remove(key);
             return;
         }
         if (arena.latestSnapshotId() <= 0) {
-            plugin.getSLF4JLogger().warn("[AutoReset] '{}' has no snapshot — skipping reset.", arenaName);
-            // Restart the countdown for the next cycle.
+            plugin.getSLF4JLogger().warn("[AutoReset] '{}' has no snapshot - skipping this cycle.", arena.name());
             startCountdown(arena);
             return;
         }
-        plugin.getSLF4JLogger().info("[AutoReset] Triggering regeneration for '{}'.", arenaName);
-        // Broadcast "resetting now" message.
-        final Component msg = ColorUtil.mini(
-                "<gold>⚠ <yellow>" + arenaName + " <red>is now regenerating<gold>...");
-        arenaManager.forEachPlayerInArena(arena, player -> player.sendMessage(msg));
-        // Trigger regen (will teleport players to spawn first).
-        // When dirty-tracking is enabled, restore only changed voxels for speed;
-        // otherwise do a full snapshot restore.
-        final RegenMode mode = arena.asyncRegen()
-                ? RegenMode.LAYER_BY_LAYER
-                : RegenMode.INSTANT;
-        final boolean allowDirty = plugin.configManager().performance().dirtyTracking;
-        regenManager.regen(arenaName, mode, true, allowDirty)
-                .whenComplete((task, err) -> {
-                    if (err == null) {
-                        // Restart the countdown for the next cycle.
-                        startCountdown(arena);
-                    } else {
-                        plugin.getSLF4JLogger().warn("[AutoReset] Regen failed for '{}': {}",
-                                arenaName, err.getMessage());
-                        // Restart anyway so it tries again next cycle.
-                        startCountdown(arena);
-                    }
-                });
+        final Messages messages = plugin.messages();
+        arenaManager.forEachPlayerInArena(arena, player -> messages.send(player, "auto-reset.now", "arena", arena.name()));
+        final RegenMode mode = arena.asyncRegen() ? RegenMode.LAYER_BY_LAYER : RegenMode.INSTANT;
+        final boolean safe = plugin.configManager().general().safeModeDefault;
+        regenManager.regen(arena.name(), mode, safe, true).whenComplete((task, err) -> {
+            if (err != null) {
+                plugin.getSLF4JLogger().warn("[AutoReset] Restore of '{}' failed: {}", arena.name(), err.getMessage());
+            }
+            // Restart only if the arena still exists, is the same instance, and nobody stopped the timer.
+            final Arena live = arenaManager.getArena(arena.name());
+            if (live == arena && countdowns.containsKey(key)) {
+                startCountdown(live);
+            }
+        });
     }
 
-    /**
-     * Format seconds as a human-readable time string.
-     */
-    private @NotNull String formatTime(final long seconds) {
+    private static @NotNull String formatTime(final long seconds) {
         if (seconds >= 60) {
             final long mins = seconds / 60;
             final long secs = seconds % 60;
-            if (secs == 0) {
-                return mins + " minute" + (mins > 1 ? "s" : "");
-            }
-            return mins + "m " + secs + "s";
+            return secs == 0 ? mins + (mins == 1 ? " minute" : " minutes") : mins + "m " + secs + "s";
         }
-        return seconds + " second" + (seconds > 1 ? "s" : "");
+        return seconds + (seconds == 1 ? " second" : " seconds");
     }
 
-    /**
-     * Shutdown: cancel the driver.
-     */
+    private static @NotNull String key(@NotNull final String arenaName) {
+        return arenaName.toLowerCase(Locale.ROOT);
+    }
+
+    /** Cancel the driver and drop all timers. */
     public void shutdown() {
         if (driver != null) {
             driver.cancel();
@@ -216,10 +162,7 @@ public final class AutoResetManager {
         countdowns.clear();
     }
 
-    /**
-     * Initialize countdowns for all arenas that have auto-reset enabled.
-     * Called after arenas are loaded from disk.
-     */
+    /** Start countdowns for every arena with auto-reset enabled and a snapshot. */
     public void initializeAll() {
         for (final Arena arena : arenaManager.all()) {
             if (arena.autoResetInterval() > 0 && arena.latestSnapshotId() > 0) {

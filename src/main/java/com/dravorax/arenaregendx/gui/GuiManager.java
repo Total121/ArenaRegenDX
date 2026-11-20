@@ -1,6 +1,6 @@
 /*
  * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * Copyright (C) 2026 DravoraX. All rights reserved.
  */
 
 package com.dravorax.arenaregendx.gui;
@@ -67,6 +67,12 @@ public final class GuiManager implements Listener {
     /** Click debounce to prevent double-fire from lag / rapid clicks. */
     private final Map<UUID, Long> lastClickNanos = new ConcurrentHashMap<>();
     private static final long CLICK_DEBOUNCE_NS = 250_000_000L; // 250ms
+    /** Arena awaiting a second "delete" click, per player (expires). */
+    private final Map<UUID, PendingDelete> pendingDeletes = new ConcurrentHashMap<>();
+    private static final long DELETE_CONFIRM_MS = 10_000L;
+
+    private record PendingDelete(@NotNull String arena, long expiresAt) {
+    }
 
     public GuiManager(@NotNull final ArenaRegenDXPlugin plugin,
                       @NotNull final ArenaManager arenaManager,
@@ -142,7 +148,8 @@ public final class GuiManager implements Listener {
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInventoryClick(@NotNull final InventoryClickEvent event) {
         final Inventory top = event.getView().getTopInventory();
-        if (!(top.getHolder() instanceof GuiHolder holder)) {
+        // getHolder(false): never snapshot a block state just to test the holder type.
+        if (!(top.getHolder(false) instanceof GuiHolder holder)) {
             return;
         }
         event.setCancelled(true); // our GUIs are read/action-only, never item-movable
@@ -175,14 +182,14 @@ public final class GuiManager implements Listener {
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInventoryDrag(@NotNull final InventoryDragEvent event) {
-        if (event.getView().getTopInventory().getHolder() instanceof GuiHolder) {
+        if (event.getView().getTopInventory().getHolder(false) instanceof GuiHolder) {
             event.setCancelled(true);
         }
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInventoryCreative(@NotNull final InventoryCreativeEvent event) {
-        if (event.getView().getTopInventory().getHolder() instanceof GuiHolder) {
+        if (event.getView().getTopInventory().getHolder(false) instanceof GuiHolder) {
             event.setCancelled(true);
         }
     }
@@ -190,26 +197,53 @@ public final class GuiManager implements Listener {
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onSwapHands(@NotNull final PlayerSwapHandItemsEvent event) {
         final var open = event.getPlayer().getOpenInventory().getTopInventory();
-        if (open.getHolder() instanceof GuiHolder) {
+        if (open.getHolder(false) instanceof GuiHolder) {
             event.setCancelled(true);
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onInventoryClose(@NotNull final InventoryCloseEvent event) {
-        if (event.getPlayer() instanceof Player player
-                && event.getView().getTopInventory().getHolder() instanceof GuiHolder holder
-                && holder.type() == GuiType.ARENA_EDIT) {
-            com.dravorax.arenaregendx.gui.menus.ArenaEditMenu.clearPending(player.getUniqueId());
+        // Re-opening a menu (page change, refresh) closes the old view with OPEN_NEW:
+        // keep the session and any pending confirmation in that case.
+        if (event.getReason() == InventoryCloseEvent.Reason.OPEN_NEW) {
+            return;
         }
-        sessions.remove(event.getPlayer().getUniqueId());
+        if (event.getView().getTopInventory().getHolder(false) instanceof GuiHolder) {
+            pendingDeletes.remove(event.getPlayer().getUniqueId());
+            sessions.remove(event.getPlayer().getUniqueId());
+        }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(@NotNull final PlayerQuitEvent event) {
-        sessions.remove(event.getPlayer().getUniqueId());
-        lastClickNanos.remove(event.getPlayer().getUniqueId());
-        com.dravorax.arenaregendx.gui.menus.ArenaEditMenu.clearPending(event.getPlayer().getUniqueId());
+        final UUID id = event.getPlayer().getUniqueId();
+        sessions.remove(id);
+        lastClickNanos.remove(id);
+        pendingDeletes.remove(id);
+    }
+
+    /**
+     * Two-click delete confirmation.
+     *
+     * @return true if this click confirms an earlier one for the same arena.
+     */
+    public boolean confirmDelete(@NotNull final Player player, @NotNull final String arenaName) {
+        final long now = System.currentTimeMillis();
+        final PendingDelete pending = pendingDeletes.get(player.getUniqueId());
+        if (pending != null && pending.arena().equals(arenaName) && pending.expiresAt() >= now) {
+            pendingDeletes.remove(player.getUniqueId());
+            return true;
+        }
+        pendingDeletes.put(player.getUniqueId(), new PendingDelete(arenaName, now + DELETE_CONFIRM_MS));
+        return false;
+    }
+
+    /** @return true if {@code player} has clicked delete once for {@code arenaName} recently. */
+    public boolean isDeletePending(@NotNull final Player player, @NotNull final String arenaName) {
+        final PendingDelete pending = pendingDeletes.get(player.getUniqueId());
+        return pending != null && pending.arena().equals(arenaName)
+                && pending.expiresAt() >= System.currentTimeMillis();
     }
 
     // -----------------------------------------------------------------------
@@ -228,14 +262,20 @@ public final class GuiManager implements Listener {
      * Shutdown: close all open GUIs.
      */
     public void shutdown() {
-        for (final UUID id : sessions.keySet()) {
-            final Player p = plugin.getServer().getPlayer(id);
-            if (p != null) {
-                plugin.scheduler().runAtEntity(p, p::closeInventory);
+        // Close our menus directly: schedulers reject new tasks while the plugin disables,
+        // and leaving them open would let players take the menu items.
+        for (final Player p : plugin.getServer().getOnlinePlayers()) {
+            try {
+                if (p.getOpenInventory().getTopInventory().getHolder(false) instanceof GuiHolder) {
+                    p.closeInventory();
+                }
+            } catch (final Throwable ignored) {
+                // Folia: player owned by another region; the menu is inert once we are disabled
             }
         }
         sessions.clear();
         lastClickNanos.clear();
+        pendingDeletes.clear();
     }
 
     // -----------------------------------------------------------------------

@@ -39,7 +39,7 @@ public final class RegenProgressBar {
     public RegenProgressBar(@NotNull final String arenaName, @Nullable final SchedulerAdapter scheduler) {
         this.scheduler = scheduler;
         this.bar = BossBar.bossBar(
-                Component.text("ArenaRegenDX · " + arenaName),
+                Component.text("Restoring " + arenaName),
                 0f,
                 BossBar.Color.YELLOW,
                 BossBar.Overlay.PROGRESS);
@@ -95,9 +95,11 @@ public final class RegenProgressBar {
     }
 
     private void runAtPlayer(@NotNull final Player player, @NotNull final Runnable action) {
-        if (scheduler != null) {
+        final org.bukkit.plugin.Plugin owner = org.bukkit.Bukkit.getPluginManager().getPlugin("ArenaRegenDX");
+        if (scheduler != null && owner != null && owner.isEnabled()) {
             scheduler.runAtEntity(player, action);
         } else {
+            // Disabling: schedulers reject new tasks, but bars must still be removed client-side.
             action.run();
         }
     }

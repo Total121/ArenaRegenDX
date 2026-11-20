@@ -5,6 +5,8 @@
 
 package com.dravorax.arenaregendx.snapshot;
 
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.ByteArrayInputStream;
@@ -12,8 +14,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.GZIPInputStream;
@@ -27,7 +27,7 @@ import java.util.zip.InflaterInputStream;
  * <h2>On-disk format (version 1)</h2>
  * <pre>
  *   Header (16 bytes):
- *     magic       : 4 bytes  "SARP"
+ *     magic       : 4 bytes  "ARDX" (legacy "SARP" accepted on read)
  *     version     : 1 byte   = 1
  *     flags       : 1 byte   bit0: compressed
  *     compression : 1 byte   0=none, 1=gzip, 2=zlib
@@ -92,6 +92,13 @@ public final class SnapshotSerializer {
     public static final int COMPRESSION_GZIP = 1;
     public static final int COMPRESSION_ZLIB = 2;
 
+    /** Largest volume a snapshot may describe (matches the capture limit). */
+    public static final long MAX_VOLUME = 100_000_000L;
+    private static final int MAX_PALETTE = 1 << 20;
+    private static final int MAX_STRING = 1 << 16;
+    private static final int MAX_PAYLOAD = 16 << 20;
+    private static final int MAX_ENTITIES = 1 << 20;
+
     private SnapshotSerializer() {
         // static utility
     }
@@ -130,8 +137,12 @@ public final class SnapshotSerializer {
         final java.io.OutputStream body;
         final Deflater deflater;
         if (compression == COMPRESSION_GZIP) {
-            final GZIPOutputStream gz = new GZIPOutputStream(byteOut);
-            body = gz;
+            final int level = compressionLevel < 0 ? Deflater.DEFAULT_COMPRESSION : compressionLevel;
+            body = new GZIPOutputStream(byteOut, 8192) {
+                {
+                    def.setLevel(level);
+                }
+            };
             deflater = null;
         } else if (compression == COMPRESSION_ZLIB) {
             deflater = new Deflater(compressionLevel < 0 ? Deflater.DEFAULT_COMPRESSION : compressionLevel);
@@ -162,16 +173,15 @@ public final class SnapshotSerializer {
         }
 
         // 2. RLE-encoded block array.
-        final int[] ids = s.blockDataIds();
-        final int n = ids.length;
+        final PaletteIds ids = s.ids();
+        final int n = ids.length();
         int i = 0;
-        // First pass to count runs (so we can prefix the count). Could write runs
-        // directly without count and use a sentinel; counting is simpler & cheap.
+        // First pass counts runs so the count can prefix them (format compatibility).
         int runCount = 0;
         while (i < n) {
-            final int cur = ids[i];
+            final int cur = ids.get(i);
             int len = 1;
-            while (i + len < n && ids[i + len] == cur && len < 0x3FFFFFFF) {
+            while (i + len < n && ids.get(i + len) == cur && len < 0x3FFFFFFF) {
                 len++;
             }
             runCount++;
@@ -180,9 +190,9 @@ public final class SnapshotSerializer {
         writeVarInt(out, runCount);
         i = 0;
         while (i < n) {
-            final int cur = ids[i];
+            final int cur = ids.get(i);
             int len = 1;
-            while (i + len < n && ids[i + len] == cur && len < 0x3FFFFFFF) {
+            while (i + len < n && ids.get(i + len) == cur && len < 0x3FFFFFFF) {
                 len++;
             }
             writeVarInt(out, cur);
@@ -191,10 +201,10 @@ public final class SnapshotSerializer {
         }
 
         // 3. Tile entities.
-        final Map<Integer, byte[]> tiles = s.tileEntities();
+        final Int2ObjectMap<byte[]> tiles = s.tileEntities();
         writeVarInt(out, tiles.size());
-        for (final var e : tiles.entrySet()) {
-            writeVarInt(out, e.getKey());
+        for (final Int2ObjectMap.Entry<byte[]> e : tiles.int2ObjectEntrySet()) {
+            writeVarInt(out, e.getIntKey());
             final byte[] v = e.getValue();
             writeVarInt(out, v.length);
             out.write(v);
@@ -246,6 +256,7 @@ public final class SnapshotSerializer {
         final int sizeX = in.readInt();
         final int sizeY = in.readInt();
         final int sizeZ = in.readInt();
+        validateDimensions(sizeX, sizeY, sizeZ);
 
         // Wrap the remaining stream with the appropriate decompression.
         final java.io.InputStream body;
@@ -278,9 +289,15 @@ public final class SnapshotSerializer {
                                               final long createdAt) throws IOException {
         // 1. Unique block data strings.
         final int uniqCount = readVarInt(in);
+        if (uniqCount <= 0 || uniqCount > MAX_PALETTE) {
+            throw new IOException("Corrupt snapshot: palette size " + uniqCount);
+        }
         final String[] uniq = new String[uniqCount];
         for (int i = 0; i < uniqCount; i++) {
             final int len = readVarInt(in);
+            if (len < 0 || len > MAX_STRING) {
+                throw new IOException("Corrupt snapshot: palette entry length " + len);
+            }
             final byte[] b = new byte[len];
             in.readFully(b);
             uniq[i] = new String(b, java.nio.charset.StandardCharsets.UTF_8);
@@ -288,14 +305,17 @@ public final class SnapshotSerializer {
 
         // 2. RLE-decoded block array.
         final int totalBlocks = sizeX * sizeY * sizeZ;
-        final int[] ids = new int[totalBlocks];
+        final PaletteIds ids = PaletteIds.allocate(totalBlocks, uniqCount);
         final int runCount = readVarInt(in);
         int pos = 0;
         for (int r = 0; r < runCount; r++) {
             final int dataId = readVarInt(in);
             final int len = readVarInt(in);
-            // Fill the run.
-            java.util.Arrays.fill(ids, pos, pos + len, dataId);
+            if (dataId < 0 || dataId >= uniqCount || len <= 0 || len > totalBlocks - pos) {
+                throw new IOException("Corrupt snapshot: bad block run #" + r
+                        + " (id=" + dataId + ", len=" + len + ", pos=" + pos + ")");
+            }
+            ids.fill(pos, pos + len, dataId);
             pos += len;
         }
         if (pos != totalBlocks) {
@@ -304,10 +324,16 @@ public final class SnapshotSerializer {
 
         // 3. Tile entities.
         final int tileCount = readVarInt(in);
-        final Map<Integer, byte[]> tiles = new HashMap<>(tileCount * 2);
+        if (tileCount < 0 || tileCount > totalBlocks) {
+            throw new IOException("Corrupt snapshot: tile count " + tileCount);
+        }
+        final Int2ObjectOpenHashMap<byte[]> tiles = new Int2ObjectOpenHashMap<>(tileCount);
         for (int i = 0; i < tileCount; i++) {
             final int flatIndex = readVarInt(in);
             final int payloadLen = readVarInt(in);
+            if (flatIndex < 0 || flatIndex >= totalBlocks || payloadLen < 0 || payloadLen > MAX_PAYLOAD) {
+                throw new IOException("Corrupt snapshot: tile entry " + flatIndex + " / " + payloadLen);
+            }
             final byte[] payload = new byte[payloadLen];
             in.readFully(payload);
             tiles.put(flatIndex, payload);
@@ -315,9 +341,15 @@ public final class SnapshotSerializer {
 
         // 4. Entities.
         final int entityCount = readVarInt(in);
+        if (entityCount < 0 || entityCount > MAX_ENTITIES) {
+            throw new IOException("Corrupt snapshot: entity count " + entityCount);
+        }
         final Snapshot.EntityPayload[] entities = new Snapshot.EntityPayload[entityCount];
         for (int i = 0; i < entityCount; i++) {
             final int typeLen = readVarInt(in);
+            if (typeLen < 0 || typeLen > MAX_STRING) {
+                throw new IOException("Corrupt snapshot: entity type length " + typeLen);
+            }
             final byte[] tb = new byte[typeLen];
             in.readFully(tb);
             final String type = new String(tb, java.nio.charset.StandardCharsets.UTF_8);
@@ -327,6 +359,9 @@ public final class SnapshotSerializer {
             final float yaw = in.readFloat();
             final float pitch = in.readFloat();
             final int payloadLen = readVarInt(in);
+            if (payloadLen < 0 || payloadLen > MAX_PAYLOAD) {
+                throw new IOException("Corrupt snapshot: entity payload length " + payloadLen);
+            }
             final byte[] payload = new byte[payloadLen];
             in.readFully(payload);
             entities[i] = new Snapshot.EntityPayload(type, x, y, z, yaw, pitch, payload);
@@ -366,7 +401,18 @@ public final class SnapshotSerializer {
 
     /** Read only the header from a byte array (without decompressing the body). */
     public static @NotNull HeaderInfo readHeader(final byte @NotNull [] bytes) throws IOException {
-        final DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes));
+        return readHeader(new ByteArrayInputStream(bytes));
+    }
+
+    /** Read only the 28-byte header from a file, without loading the body. */
+    public static @NotNull HeaderInfo readHeader(@NotNull final java.nio.file.Path file) throws IOException {
+        try (java.io.InputStream raw = java.nio.file.Files.newInputStream(file)) {
+            return readHeader(new java.io.BufferedInputStream(raw, 64));
+        }
+    }
+
+    private static @NotNull HeaderInfo readHeader(@NotNull final java.io.InputStream stream) throws IOException {
+        final DataInputStream in = new DataInputStream(stream);
         final int magic = in.readInt();
         if (magic != MAGIC && magic != LEGACY_MAGIC) {
             throw new IOException("Invalid snapshot file: bad magic");
@@ -380,6 +426,14 @@ public final class SnapshotSerializer {
         final int sizeY = in.readInt();
         final int sizeZ = in.readInt();
         return new HeaderInfo(version, flags, compression, createdAt, sizeX, sizeY, sizeZ);
+    }
+
+    /** Reject absurd dimensions before allocating anything (corrupt / hostile files). */
+    private static void validateDimensions(final int sizeX, final int sizeY, final int sizeZ) throws IOException {
+        if (sizeX <= 0 || sizeY <= 0 || sizeZ <= 0
+                || (long) sizeX * sizeY * sizeZ > MAX_VOLUME) {
+            throw new IOException("Corrupt snapshot: dimensions " + sizeX + "x" + sizeY + "x" + sizeZ);
+        }
     }
 
     /** Parsed header fields. */

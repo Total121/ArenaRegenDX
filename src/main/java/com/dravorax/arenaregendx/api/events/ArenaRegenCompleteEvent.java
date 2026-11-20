@@ -14,9 +14,9 @@ import org.jetbrains.annotations.NotNull;
  * Fired when an arena regeneration completes successfully.
  *
  * <p>Listeners can use this to broadcast a message, restart a match, award
- * participants, etc. The event fires on the region thread that completed the
- * final batch (Folia) or the main thread (Paper). For thread-sensitive work,
- * schedule your handler appropriately.</p>
+ * participants, etc. The event fires on the main thread (Paper) or the global
+ * region thread (Folia); on Folia, hop to an entity / region scheduler before
+ * touching players or blocks.</p>
  *
  * @author DravoraX
  * @since 1.0.0

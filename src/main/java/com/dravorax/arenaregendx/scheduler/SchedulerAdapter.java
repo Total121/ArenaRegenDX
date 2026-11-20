@@ -1,6 +1,7 @@
 /*
- * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * ArenaRegenDX - High-performance arena regeneration
+ * Copyright (C) 2026 DravoraX. All rights reserved.
+ * Licensed exclusively to DravoraX.
  */
 
 package com.dravorax.arenaregendx.scheduler;
@@ -11,170 +12,109 @@ import org.bukkit.entity.Entity;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.concurrent.TimeUnit;
-
 /**
  * Platform-agnostic scheduler abstraction.
  *
- * <p>This interface is the single point through which all scheduling must flow.
- * It hides the differences between Paper's {@code BukkitScheduler} (one main thread)
- * and Folia's region/entity/async schedulers (multiple region threads, no global
- * main thread).</p>
+ * <p>This interface is the single point through which all scheduling flows.
+ * It hides the differences between Paper's {@code BukkitScheduler} (one main
+ * thread) and Folia's region/entity/async schedulers (many region threads, no
+ * global main thread).</p>
  *
  * <h2>Design rules</h2>
  * <ul>
- *   <li><b>Async work</b> (compression, file IO, snapshot serialization) must use
- *       {@link #runAsync(Runnable)} or {@link #runAsyncDelayed(Runnable, long)}.
- *       Never touch Bukkit API off-thread except for thread-safe reads.</li>
- *   <li><b>Block placement</b> must use {@link #runAtLocation(Location, Runnable)}
- *       so Folia dispatches to the correct region thread.</li>
- *   <li><b>Entity-related work</b> must use {@link #runAtEntity(Entity, Runnable)}
- *       (teleports, entity metadata).</li>
- *   <li><b>Periodic tasks</b> (TPS monitor, visualizer) use
- *       {@link #runAsyncRepeating(Runnable, long, long)}.</li>
+ *   <li><b>Async work</b> (compression, file IO, serialization) uses
+ *       {@link #runAsync(Runnable)}. Never touch world state off-thread.</li>
+ *   <li><b>Block access</b> uses {@link #runAtLocation(Location, Runnable)} so
+ *       Folia dispatches to the region thread that owns the chunk.</li>
+ *   <li><b>Entity / player work</b> (teleports, messages, UI) uses
+ *       {@link #runAtEntity(Entity, Runnable)} which follows the entity across
+ *       region boundaries.</li>
+ *   <li><b>Global bookkeeping</b> (queue drivers, timers) uses the global
+ *       region via {@link #runGlobalRepeating(Runnable, long, long)}.</li>
  * </ul>
  *
- * <p>All methods return a {@link TaskHandle} that can be used for cancellation,
- * enabling deterministic shutdown.</p>
+ * <p>Every method returns a {@link TaskHandle} for deterministic cancellation.
+ * Exceptions thrown by scheduled tasks are logged and never propagate into
+ * the server scheduler.</p>
  *
  * @author DravoraX
  * @since 1.0.0
  */
 public interface SchedulerAdapter {
 
-    /**
-     * Execute a task asynchronously. Safe for IO, compression, serialization.
-     *
-     * @param task the task to run.
-     * @return a handle for cancellation.
-     */
+    /** Run a task asynchronously. Safe for IO, compression, serialization. */
     @NotNull TaskHandle runAsync(@NotNull Runnable task);
 
-    /**
-     * Execute a task asynchronously after a delay.
-     *
-     * @param task      the task to run.
-     * @param delayTicks the delay in server ticks (20 = 1s). Converted internally.
-     * @return a handle.
-     */
+    /** Run a task asynchronously after {@code delayTicks} (20 ticks = 1 second). */
     @NotNull TaskHandle runAsyncDelayed(@NotNull Runnable task, long delayTicks);
 
-    /**
-     * Schedule a repeating async task.
-     *
-     * @param task        the task.
-     * @param delayTicks  initial delay in ticks.
-     * @param periodTicks period in ticks.
-     * @return a handle.
-     */
+    /** Schedule a repeating async task. */
     @NotNull TaskHandle runAsyncRepeating(@NotNull Runnable task, long delayTicks, long periodTicks);
 
     /**
-     * Run a task on the region that owns the given location.
-     *
-     * <p>On Paper this is the main thread; on Folia it is the region thread for
-     * the chunk at that location. Use this for all block-state mutations.</p>
-     *
-     * @param location the location (defines the region).
-     * @param task     the task to run.
-     * @return a handle.
+     * Run a task on the thread that owns the chunk at {@code location}
+     * (the main thread on Paper, the owning region thread on Folia).
      */
-    @NotNull TaskHandle runAtLocation(@NotNull Location location, @NotNull Runnable task);
+    default @NotNull TaskHandle runAtLocation(@NotNull final Location location, @NotNull final Runnable task) {
+        return runAtLocation(location, task, null);
+    }
 
     /**
      * Like {@link #runAtLocation(Location, Runnable)} but invokes
-     * {@code onScheduleFailure} on the global scheduler if the region task
-     * could not be queued after retries (Folia). Paper never calls the failure
-     * callback. Use this so batch drivers can clear {@code batchInFlight}.
+     * {@code onScheduleFailure} if the task could not be queued at all (for
+     * example while the plugin is disabling). Batch drivers use this so their
+     * in-flight flags are always released.
      */
-    default @NotNull TaskHandle runAtLocation(@NotNull final Location location,
-                                              @NotNull final Runnable task,
-                                              @Nullable final Runnable onScheduleFailure) {
-        return runAtLocation(location, task);
+    @NotNull TaskHandle runAtLocation(@NotNull Location location, @NotNull Runnable task,
+                                      @Nullable Runnable onScheduleFailure);
+
+    /** Run a task on the thread that owns {@code entity}. */
+    default @NotNull TaskHandle runAtEntity(@NotNull final Entity entity, @NotNull final Runnable task) {
+        return runAtEntity(entity, task, null);
     }
 
     /**
-     * Run a task on the region that owns the given entity, on the entity scheduler.
-     *
-     * @param entity the entity.
-     * @param task   the task to run.
-     * @return a handle.
+     * Run a task on the thread that owns {@code entity}. If the entity is removed
+     * (player logged out, mob despawned) before the task runs, {@code retired}
+     * runs instead, when provided.
      */
-    @NotNull TaskHandle runAtEntity(@NotNull Entity entity, @NotNull Runnable task);
+    @NotNull TaskHandle runAtEntity(@NotNull Entity entity, @NotNull Runnable task, @Nullable Runnable retired);
 
-    /**
-     * Run a task on the global region scheduler (Folia) or main thread (Paper).
-     * Use sparingly — prefer region-specific scheduling.
-     *
-     * @param task the task.
-     * @return a handle.
-     */
+    /** Run a task on the global region (Folia) or main thread (Paper). */
     @NotNull TaskHandle runGlobal(@NotNull Runnable task);
 
-    /**
-     * Run a task on the global region scheduler after a delay.
-     *
-     * @param task        the task.
-     * @param delayTicks  the delay in ticks.
-     * @return a handle.
-     */
+    /** Run a task on the global region after a delay. */
     @NotNull TaskHandle runGlobalDelayed(@NotNull Runnable task, long delayTicks);
 
-    /**
-     * Run a repeating task on the global region scheduler.
-     *
-     * @param task        the task.
-     * @param delayTicks  the initial delay.
-     * @param periodTicks the period.
-     * @return a handle.
-     */
+    /** Run a repeating task on the global region. */
     @NotNull TaskHandle runGlobalRepeating(@NotNull Runnable task, long delayTicks, long periodTicks);
 
     /**
-     * Check whether a chunk at the given coordinates is loaded, without forcing load.
-     *
-     * @param world the world.
-     * @param x     block X.
-     * @param z     block Z.
-     * @return true if the chunk is loaded.
+     * @return true when the calling thread may touch the given chunk right now
+     *         (Paper: the main thread; Folia: the owning region thread). Callers
+     *         use this to run work inline instead of paying a one-tick hop.
      */
-    boolean isChunkLoaded(@NotNull World world, int x, int z);
+    boolean isOwnedByCurrentRegion(@NotNull World world, int chunkX, int chunkZ);
 
-    /**
-     * Ensure a chunk is loaded (async on Folia, sync on Paper). The callback runs
-     * on the appropriate thread once loaded.
-     *
-     * @param world    the world.
-     * @param chunkX   chunk X.
-     * @param chunkZ   chunk Z.
-     * @param callback runs after load (may run on region thread).
-     */
-    void ensureChunkLoaded(@NotNull World world, int chunkX, int chunkZ, @NotNull Runnable callback);
-
-    /**
-     * Cancel every task scheduled through this adapter. Used on plugin disable.
-     */
-    void cancelOwnedTasks();
-
-    /**
-     * @return a human-readable identifier of the implementation ("Paper" or "Folia").
-     */
-    @NotNull String implementationName();
-
-    /**
-     * Helper: convert ticks to milliseconds.
-     *
-     * @param ticks the tick count.
-     * @return milliseconds.
-     */
-    static long ticksToMillis(final long ticks) {
-        return Math.max(0, ticks) * 50L;
+    /** Check whether the chunk containing block {@code (x, z)} is loaded, without loading it. */
+    default boolean isChunkLoaded(@NotNull final World world, final int x, final int z) {
+        return world.isChunkLoaded(x >> 4, z >> 4);
     }
 
     /**
-     * Helper: convert ticks to a {@link TimeUnit#MILLISECONDS} value.
+     * Load a chunk asynchronously, then run {@code callback} on the thread that
+     * owns it. The callback always runs, even if the load failed.
      */
-    static long ticksToMillisUnit(final long ticks) {
-        return ticksToMillis(ticks);
+    void ensureChunkLoaded(@NotNull World world, int chunkX, int chunkZ, @NotNull Runnable callback);
+
+    /** Cancel every task scheduled through this adapter. Used on plugin disable. */
+    void cancelOwnedTasks();
+
+    /** @return a human-readable identifier ("Paper" or "Folia"). */
+    @NotNull String implementationName();
+
+    /** Convert server ticks to milliseconds (negative values clamp to zero). */
+    static long ticksToMillis(final long ticks) {
+        return Math.max(0L, ticks) * 50L;
     }
 }

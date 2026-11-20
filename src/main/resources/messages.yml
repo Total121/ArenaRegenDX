@@ -1,54 +1,146 @@
 # ============================================================================
 # ArenaRegenDX — Messages (MiniMessage format)
-# Author: DravoraX
-# ============================================================================
-# All user-facing strings use MiniMessage tags. See:
 # https://docs.advntr.dev/minimessage/format.html
-# Variables are written as <name> in the source and substituted by the plugin.
+# ============================================================================
+# <prefix> expands to the prefix below. Other <placeholders> are filled in by
+# the plugin as plain text. Set any single-line message to "" to disable it.
+# Keys missing from this file fall back to the plugin's built-in defaults.
 
-# Prefix prepended to most messages (kept empty so commands can format their own).
-prefix: "<dark_gray>[<gold>ARDX<dark_gray>] "
+prefix: "<dark_gray>[<gradient:#5eead4:#fbbf24>ARDX</gradient><dark_gray>] "
 
-# Generic
-no-permission: "<red>You lack permission: <yellow><perm>"
-player-only: "<red>This command can only be run by a player."
-unknown-command: "<red>Unknown subcommand. Try <gold>/ardx help"
+general:
+  no-permission: "<prefix><red>You are missing the permission <yellow><perm><red>."
+  player-only: "<prefix><red>This command can only be used in-game."
+  unknown-command: "<prefix><red>Unknown subcommand <yellow><sub><red>. Try <gold>/<label> help<red>."
+  usage: "<prefix><red>Usage: <gold><usage>"
+  arena-not-found: "<prefix><red>No arena named <yellow><name><red>. See <gold>/ardx list<red>."
+  error: "<prefix><red><reason>"
+  reloaded: "<prefix><green>Configuration reloaded."
 
-# Arena lifecycle
-arena-created: "<dark_gray>» <gold>Arena <yellow><name> <green>created <dark_gray>(<yellow><size><dark_gray>)."
-arena-deleted: "<dark_gray>» <gold>Arena <yellow><name> <red>deleted<dark_gray>."
-arena-not-found: "<red>Arena not found: <yellow><name>"
-arena-exists: "<red>Arena already exists: <yellow><name>"
+help:
+  - ""
+  - "<gradient:#5eead4:#fbbf24><bold>ArenaRegenDX</bold></gradient> <gray>v<version> <dark_gray>by <yellow>DravoraX"
+  - "<dark_gray>────────────────────────────────────"
+  - "<gold>/<label> wand <gray>selection wand (dust outline)"
+  - "<gold>/<label> create <name> [reset] <gray>arena from selection + snapshot"
+  - "<gold>/<label> list <dark_gray>| <gold>info <arena> <gray>arenas and details"
+  - "<gold>/<label> regen <arena> [mode] <gray>restore the arena"
+  - "<gold>/<label> cancel [arena] <gray>abort a running restore"
+  - "<gold>/<label> save <arena> <gray>recapture the snapshot"
+  - "<gold>/<label> snapshots <arena> <dark_gray>| <gold>load <arena> <id> <gray>pick a restore point"
+  - "<gold>/<label> exclude add <arena> <zone> <gray>protect a spawn / any volume"
+  - "<gold>/<label> exclude show <arena> <gray>gold = regen, red = protected"
+  - "<gold>/<label> autoreset <arena> <time|off> <gray>timed resets"
+  - "<gold>/<label> speed <global|arena> <value> <gray>slow/normal/fast/max/%"
+  - "<gold>/<label> setspawn <arena> [clear] <gray>teleport target on restore"
+  - "<gold>/<label> gui <dark_gray>| <gold>status <dark_gray>| <gold>reload"
+  - "<dark_gray>────────────────────────────────────"
+  - "<gray>Warzone tip: select the whole map, create the arena, then"
+  - "<gray>wand-select the spawn and <white>/<label> exclude add <arena> spawn<gray>."
+  - ""
 
-# Selection
-selection-pos1: "<gold>Position 1 <dark_gray>» <yellow><x>, <y>, <z>"
-selection-pos2: "<yellow>Position 2 <dark_gray>» <gold><x>, <y>, <z>"
-selection-incomplete: "<red>You must select a region first (use <gold>/ardx wand<red>)."
-selection-different-worlds: "<red>Both corners must be in the same world."
+selection:
+  pos1: "<green>Pos 1 <dark_gray>» <yellow><x>, <y>, <z>"
+  pos2: "<aqua>Pos 2 <dark_gray>» <yellow><x>, <y>, <z>"
+  size: "<prefix><gold>Selection <yellow><size> <gray>(<blocks> blocks)"
+  missing: "<prefix><red>Select a region first with <gold>/ardx wand<red> (or WorldEdit)."
+  wand-given:
+    - "<prefix><gold>Selection wand given."
+    - "<gray>Left click = pos 1 (lime dust). Right click = pos 2 (aqua dust)."
+    - "<gray>A complete box shows a gold outline with cyan faces."
 
-# Snapshots
-snapshot-saving: "<dark_gray>» <gold>Saving snapshot for <yellow><name><dark_gray>..."
-snapshot-saved: "<dark_gray>» <green>Snapshot saved <dark_gray>(<yellow>#<id><dark_gray>, <yellow><blocks> blocks<dark_gray>, <yellow><size><dark_gray>, <yellow><ms>ms<dark_gray>)."
-snapshot-load-failed: "<red>Snapshot load failed: <yellow><reason>"
-snapshot-not-found: "<red>Arena has no snapshot. Run <gold>/ardx save <name> <red>first."
+arena:
+  created: "<prefix><gold>Arena <yellow><name> <dark_gray>(<yellow><size><dark_gray>) <green>created."
+  exclude-tip: "<prefix><gray>Protect a spawn inside it with <gold>/ardx exclude add <name> spawn"
+  list-header: "<prefix><gold>Arenas <dark_gray>(<yellow><count><dark_gray>)"
+  list-entry: "<dark_gray> • <yellow><name> <dark_gray>[<gray><status><dark_gray>] <gray><size> in <world>"
+  list-empty: "<prefix><gray>No arenas yet. Select a region with <gold>/ardx wand<gray>, then <gold>/ardx create <name><gray>."
+  info:
+    - "<prefix><gold>Arena <yellow><name>"
+    - "<dark_gray> • <gray>Status: <white><status>"
+    - "<dark_gray> • <gray>World: <white><world> <dark_gray>@ <white><origin>"
+    - "<dark_gray> • <gray>Size: <white><size> <dark_gray>(<white><blocks> blocks<dark_gray>)"
+    - "<dark_gray> • <gray>Snapshot: <white><snapshot> <dark_gray>| <gray>last restore: <white><last-regen>"
+    - "<dark_gray> • <gray>Auto reset: <white><auto-reset> <dark_gray>| <gray>speed: <white><speed>"
+    - "<dark_gray> • <gray>Exclusions: <white><exclusions> <dark_gray>| <gray>spawn: <white><spawn>"
+    - "<dark_gray> • <gray>Changed since last restore: <white><dirty>"
+  delete-confirm: "<prefix><red>This permanently deletes <yellow><name> <red>and all its snapshots. Run <gold>/ardx delete <name> confirm <red>within 20s."
+  delete-expired: "<prefix><red>Confirmation expired. Run <gold>/ardx delete <name> <red>first."
+  deleted: "<prefix><gold>Arena <yellow><name> <red>deleted."
+  renamed: "<prefix><green>Renamed <yellow><old> <green>to <yellow><new><green>."
+  spawn-set: "<prefix><green>Spawn for <yellow><name> <green>set at <yellow><location><green>."
+  spawn-cleared: "<prefix><green>Spawn for <yellow><name> <green>cleared."
+  wrong-world: "<prefix><red>That must be done in the arena world <yellow><world><red>."
+  autoreset-set: "<prefix><green>Auto reset for <yellow><name> <green>every <yellow><seconds>s<green>."
+  autoreset-off: "<prefix><green>Auto reset for <yellow><name> <green>disabled."
 
-# Regeneration
-regen-started: "<dark_gray>» <gold>Regenerating arena <yellow><name> <dark_gray>(mode: <yellow><mode><dark_gray>)..."
-regen-complete: "<dark_gray>» <green>Regeneration complete <dark_gray>(<yellow><blocks> blocks<dark_gray>)."
-regen-failed: "<red>Regen failed: <yellow><reason>"
-regen-queue-full: "<red>Regeneration queue is full. Try again shortly."
+snapshot:
+  saving: "<prefix><gold>Capturing <yellow><name><gold>..."
+  saved: "<prefix><green>Snapshot saved <dark_gray>(<yellow>#<id><dark_gray>, <yellow><blocks> blocks<dark_gray>, <yellow><size><dark_gray>, <yellow><ms>ms<dark_gray>)."
+  save-failed: "<prefix><red>Snapshot failed: <yellow><reason>"
+  none: "<prefix><red><name> has no snapshot. Run <gold>/ardx save <name><red>."
+  loading: "<prefix><gray>Loading snapshot <yellow>#<id><gray>..."
+  selected: "<prefix><green>Snapshot <yellow>#<id> <green>is now the restore point of <yellow><name><green>. Restore with <gold>/ardx regen <name><green>."
+  load-failed: "<prefix><red>Could not load the snapshot: <yellow><reason>"
+  list-header: "<prefix><gold>Snapshots of <yellow><name> <dark_gray>(<yellow><count><dark_gray>)"
+  list-entry: "<dark_gray> • <yellow>#<id> <gray><date> <dark_gray>| <gray><size> <dark_gray>| <gray><file-size><active>"
+  active-marker: " <green>(active)"
 
-# Status / debug
-status-header: "<dark_gray>» <gold>ArenaRegenDX <dark_gray>« <dark_gray>Status"
+regen:
+  started: "<prefix><gold>Restoring <yellow><name> <dark_gray>(<yellow><mode><dark_gray>)..."
+  done: "<prefix><green>Restored <yellow><name> <green>in <yellow><ms>ms<green>: <yellow><written> <green>written, <yellow><skipped> <green>unchanged, <yellow><excluded> <green>excluded."
+  failed: "<prefix><red>Restore failed: <yellow><reason>"
+  unknown-mode: "<prefix><red>Unknown mode. Use one of: <yellow><modes>"
+  cancelled-all: "<prefix><gold>Cancelled all restore jobs."
+  cancelled: "<prefix><gold>Cancelled the restore of <yellow><name><gold>."
+  not-running: "<prefix><red>No restore is running for <yellow><name><red>."
 
-# GUI
-gui-main-title: "<dark_gray>» <gold>ArenaRegenDX <dark_gray>«"
-gui-arena-manager-title: "<dark_gray>» <gold>Arena Manager <dark_gray>«"
-gui-settings-title: "<dark_gray>» <gold>Settings <dark_gray>«"
-gui-performance-title: "<dark_gray>» <gold>Performance <dark_gray>«"
+speed:
+  global: "<prefix><gold>Global restore speed: <yellow><speed>"
+  global-set: "<prefix><green>Global restore speed set to <yellow><speed><green>."
+  no-inherit: "<prefix><red>The global speed cannot be 'inherit'. Use slow, normal, fast, max or 10-500."
+  arena: "<prefix><gold><name> <gray>speed: <white><speed> <dark_gray>(effective <gold><effective>%<dark_gray>)"
+  arena-set: "<prefix><green><name> speed set to <yellow><speed> <dark_gray>(effective <gold><effective>%<dark_gray>)"
 
-# Help
-help-header: "<dark_gray>» <gold>ArenaRegenDX <dark_gray>« <dark_gray>Help"
+exclude:
+  help:
+    - "<prefix><gold>Exclusion zones <dark_gray>— blocks inside these volumes are never restored."
+    - "  <gold>/<label> exclude add <arena> <zone> <dark_gray>← cuboid from the wand"
+    - "  <gold>/<label> exclude sphere <arena> <zone> [radius]"
+    - "  <gold>/<label> exclude cylinder <arena> <zone> <radius>"
+    - "  <gold>/<label> exclude remove <arena> <zone>"
+    - "  <gold>/<label> exclude list <arena>"
+    - "  <gold>/<label> exclude show <arena> <dark_gray>| <gold>hide"
+  select-first: "<prefix><red>Wand-select the volume to protect first (or use WorldEdit)."
+  added: "<prefix><green>Exclusion <yellow><zone> <green>added to <yellow><name><green>. It will never be restored."
+  removed: "<prefix><green>Removed exclusion <yellow><zone> <green>from <yellow><name><green>."
+  not-found: "<prefix><red><name> has no exclusion named <yellow><zone><red>."
+  list-header: "<prefix><gold>Exclusions of <yellow><name>"
+  list-entry: "  <red>■ <yellow><zone>"
+  list-empty: "<prefix><gray><name> has no exclusions; the whole cuboid is restored."
+  show: "<prefix><gold>Gold dust <gray>= restored area, <red>red dust <gray>= protected."
+  hidden: "<prefix><gray>Preview hidden."
+  invalid-radius: "<prefix><red>Radius must be a number between 0.5 and 512."
 
-# Reload
-reloaded: "<dark_gray>» <green>Configuration reloaded."
+preview:
+  showing: "<prefix><gray>Showing <yellow><name> <gray>for 45s. Gold = restored, red = protected."
+
+auto-reset:
+  warning: "<gold>⚠ <yellow><arena> <gold>resets in <red><time><gold>!"
+  action-bar: "<red><time> <dark_gray>until <arena> resets"
+  now: "<gold>⚠ <yellow><arena> <red>is being restored<gold>..."
+
+status:
+  - "<prefix><gold>Status"
+  - "<dark_gray> • <yellow>TPS <gold><tps> <dark_gray>(5m <gold><tps5><dark_gray>, 15m <gold><tps15><dark_gray>) <yellow>MSPT <gold><mspt>"
+  - "<dark_gray> • <yellow>Budget <gold><budget> <dark_gray>blocks / <gold><budget-ms>ms <dark_gray>per tick, speed <gold><speed>"
+  - "<dark_gray> • <yellow>Memory <gold><memory> <dark_gray>| snapshot cache <gold><cache>"
+  - "<dark_gray> • <yellow>Writer <gold><writer> <dark_gray>| dirty tracking <gold><dirty>"
+  - "<dark_gray> • <yellow>Arenas <gold><arenas> <dark_gray>| queued <gold><queue> <dark_gray>| running <gold><running>"
+
+debug:
+  - "<prefix><gold>Debug"
+  - "<dark_gray> • Scheduler: <gold><scheduler> <dark_gray>(Folia: <gold><folia><dark_gray>)"
+  - "<dark_gray> • Java: <gold><java> <dark_gray>| Server: <gold><server>"
+  - "<dark_gray> • Writer: <gold><writer> <dark_gray>| tile NBT: <gold><nbt>"
+debug-arena: "<dark_gray>  - <yellow><name> <dark_gray><size> snap=<gold><snapshot> <dark_gray>excl=<gold><exclusions> <dark_gray>dirty=<gold><dirty> <dark_gray>status=<gold><status>"

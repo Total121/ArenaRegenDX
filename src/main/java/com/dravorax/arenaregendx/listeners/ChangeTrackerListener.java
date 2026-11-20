@@ -14,11 +14,13 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockBurnEvent;
 import org.bukkit.event.block.BlockExplodeEvent;
+import org.bukkit.event.block.BlockDispenseEvent;
 import org.bukkit.event.block.BlockFadeEvent;
 import org.bukkit.event.block.BlockFertilizeEvent;
 import org.bukkit.event.block.BlockFormEvent;
 import org.bukkit.event.block.BlockFromToEvent;
 import org.bukkit.event.block.BlockGrowEvent;
+import org.bukkit.event.block.BlockIgniteEvent;
 import org.bukkit.event.block.BlockMultiPlaceEvent;
 import org.bukkit.event.block.BlockPistonExtendEvent;
 import org.bukkit.event.block.BlockPistonRetractEvent;
@@ -27,6 +29,7 @@ import org.bukkit.event.block.BlockSpreadEvent;
 import org.bukkit.event.block.LeavesDecayEvent;
 import org.bukkit.event.block.MoistureChangeEvent;
 import org.bukkit.event.block.SpongeAbsorbEvent;
+import org.bukkit.event.block.TNTPrimeEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
@@ -38,6 +41,10 @@ import org.jetbrains.annotations.NotNull;
 
 /**
  * Feeds {@link ChangeTracker} so restore can skip untouched voxels.
+ *
+ * <p>All handlers run at MONITOR with {@code ignoreCancelled}, so they only
+ * record changes that actually happen. Lookups are O(arenas in that world)
+ * and nothing is recorded for arenas the tracker does not currently trust.</p>
  */
 public final class ChangeTrackerListener implements Listener {
 
@@ -185,8 +192,31 @@ public final class ChangeTrackerListener implements Listener {
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onIgnite(@NotNull final BlockIgniteEvent event) {
+        tracker.mark(event.getBlock().getLocation());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onTntPrime(@NotNull final TNTPrimeEvent event) {
+        // Priming removes the TNT block without a BlockBreakEvent.
+        tracker.mark(event.getBlock().getLocation());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onDispense(@NotNull final BlockDispenseEvent event) {
+        // Dispensers place water / lava / blocks in front of them.
+        final var face = event.getBlock().getBlockData() instanceof org.bukkit.block.data.Directional d
+                ? d.getFacing() : null;
+        tracker.mark(event.getBlock().getLocation());
+        if (face != null) {
+            tracker.mark(event.getBlock().getRelative(face).getLocation());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onInventoryClose(@NotNull final InventoryCloseEvent event) {
-        final var holder = event.getInventory().getHolder();
+        // getHolder(false) avoids copying the block state on every inventory close.
+        final var holder = event.getInventory().getHolder(false);
         if (holder instanceof org.bukkit.block.BlockState state) {
             tracker.mark(state.getLocation());
         } else if (holder instanceof org.bukkit.block.DoubleChest dc) {

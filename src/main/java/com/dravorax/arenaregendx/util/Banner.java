@@ -11,14 +11,15 @@ import org.jetbrains.annotations.NotNull;
 
 /**
  * Console splash printed on enable. Box-drawing only — no colour codes, so it
- * survives every logger / Windows / Linux console.
+ * survives every logger / Windows / Linux console. Disable with {@code banner: false}.
  */
 public final class Banner {
 
     private Banner() {
     }
 
-    public static void print(@NotNull final Logger log) {
+    public static void print(@NotNull final Logger log, @NotNull final String version) {
+        final String ver = ("v" + version + "                  ").substring(0, 18);
         log.info("");
         log.info("  ╔══════════════════════════════════════════════════════════╗");
         log.info("  ║                                                          ║");
@@ -43,7 +44,7 @@ public final class Banner {
         log.info("  ║                       ██████╔╝██╔╝ ██╗                   ║");
         log.info("  ║                       ╚═════╝ ╚═╝  ╚═╝                   ║");
         log.info("  ║                                                          ║");
-        log.info("  ║     snapshot · restore · dust          v2.1.0            ║");
+        log.info("  ║     snapshot · restore · dust          {}║", ver);
         log.info("  ║     paper / folia 1.21+                dravorax          ║");
         log.info("  ╚══════════════════════════════════════════════════════════╝");
         log.info("");

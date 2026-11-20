@@ -1,6 +1,7 @@
 /*
- * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * ArenaRegenDX - High-performance arena regeneration
+ * Copyright (C) 2026 DravoraX. All rights reserved.
+ * Licensed exclusively to DravoraX.
  */
 
 package com.dravorax.arenaregendx.config;
@@ -12,31 +13,32 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Loads, caches, and reloads all ArenaRegenDX configuration files.
  *
- * <p>Eight YAML files are managed:</p>
- * <ul>
- *   <li>{@code config.yml} — general settings</li>
- *   <li>{@code messages.yml} — user-facing MiniMessage strings</li>
- *   <li>{@code arenas.yml} — arena metadata (managed by ArenaManager)</li>
- *   <li>{@code gui.yml} — GUI theme/layout</li>
- *   <li>{@code performance.yml} — TPS thresholds & block budgets</li>
- *   <li>{@code storage.yml} — compression & delta storage</li>
- *   <li>{@code particles.yml} — selection visuals</li>
- *   <li>{@code sounds.yml} — sound effects</li>
- * </ul>
+ * <p>Managed files: {@code config.yml}, {@code messages.yml}, {@code arenas.yml},
+ * {@code gui.yml}, {@code performance.yml}, {@code storage.yml},
+ * {@code particles.yml}, {@code sounds.yml}.</p>
  *
- * <p>Each file ships with a default inside the jar's {@code resources/} directory.
- * On first load the default is extracted to the plugin data folder; on subsequent
- * loads user values are merged over the bundled defaults (so new keys appear
- * automatically after plugin updates).</p>
+ * <p>Each file ships with a default inside the jar. Missing files are extracted
+ * on first load; existing files are read with the bundled file as defaults, so
+ * keys added by a plugin update work without editing the user file.</p>
+ *
+ * <p>Typed settings are immutable snapshots published through volatile fields,
+ * so region threads always see a consistent view after {@code /ardx reload}.
+ * All writes go through a temp file + atomic move, so a crash mid-save can
+ * never truncate a config.</p>
  *
  * @author DravoraX
  * @since 1.0.0
@@ -49,25 +51,24 @@ public final class ConfigManager {
     };
 
     private final ArenaRegenDXPlugin plugin;
-    private final Map<String, FileConfiguration> configs = new HashMap<>();
+    private final Map<String, FileConfiguration> configs = new ConcurrentHashMap<>();
+    private final Object writeLock = new Object();
+    /** Files that failed to parse; never overwritten so the user's edits are not lost. */
+    private final java.util.Set<String> unparsable = ConcurrentHashMap.newKeySet();
 
-    // Typed settings holders (recomputed on reload).
-    private Settings.GeneralSettings general;
-    private Settings.PerformanceSettings performance;
-    private Settings.StorageSettings storage;
-    private Settings.ParticleSettings particles;
-    private Settings.SoundSettings sounds;
-    private Settings.GuiSettings gui;
+    private volatile Settings.GeneralSettings general;
+    private volatile Settings.PerformanceSettings performance;
+    private volatile Settings.StorageSettings storage;
+    private volatile Settings.ParticleSettings particles;
+    private volatile Settings.SoundSettings sounds;
+    private volatile Settings.GuiSettings gui;
 
     public ConfigManager(@NotNull final ArenaRegenDXPlugin plugin) {
         this.plugin = plugin;
     }
 
-    /**
-     * Load (or reload) every config file from disk, merging bundled defaults.
-     */
+    /** Load every config file from disk, merging bundled defaults. */
     public void loadAll() {
-        configs.clear();
         for (final String name : FILES) {
             configs.put(name, loadWithDefaults(name));
         }
@@ -75,66 +76,63 @@ public final class ConfigManager {
     }
 
     /**
-     * Reload runtime YAML without swapping {@code arenas.yml}.
-     * Arena metadata is owned by {@link com.dravorax.arenaregendx.arena.ArenaManager}
-     * and must not race with in-flight {@code saveArena} writes.
+     * Reload runtime YAML. {@code arenas.yml} is owned by the arena manager
+     * (the in-memory arena map is the source of truth) and is never re-read here.
      */
     public void reload() {
-        final FileConfiguration arenas = configs.get("arenas.yml");
         for (final String name : FILES) {
-            if ("arenas.yml".equals(name)) {
-                continue;
+            if (!"arenas.yml".equals(name)) {
+                configs.put(name, loadWithDefaults(name));
             }
-            configs.put(name, loadWithDefaults(name));
-        }
-        if (arenas != null) {
-            configs.put("arenas.yml", arenas);
-        } else if (!configs.containsKey("arenas.yml")) {
-            configs.put("arenas.yml", loadWithDefaults("arenas.yml"));
         }
         rebuildTypedSettings();
     }
 
     private void rebuildTypedSettings() {
-        this.general = Settings.GeneralSettings.from(config("config.yml"));
-        this.performance = Settings.PerformanceSettings.from(config("performance.yml"));
-        this.storage = Settings.StorageSettings.from(config("storage.yml"));
-        this.particles = Settings.ParticleSettings.from(config("particles.yml"));
-        this.sounds = Settings.SoundSettings.from(config("sounds.yml"));
-        this.gui = Settings.GuiSettings.from(config("gui.yml"));
+        this.general = Settings.GeneralSettings.from(require("config.yml"));
+        this.performance = Settings.PerformanceSettings.from(require("performance.yml"));
+        this.storage = Settings.StorageSettings.from(require("storage.yml"));
+        this.particles = Settings.ParticleSettings.from(require("particles.yml"));
+        this.sounds = Settings.SoundSettings.from(require("sounds.yml"));
+        this.gui = Settings.GuiSettings.from(require("gui.yml"));
     }
 
-    /**
-     * Save the arenas.yml file (used by ArenaManager).
-     */
-    public void saveArenas(@NotNull final FileConfiguration arenasConfig) {
-        try {
-            arenasConfig.save(file("arenas.yml"));
-        } catch (final java.io.IOException e) {
-            plugin.getSLF4JLogger().error("Could not save arenas.yml", e);
-        }
-    }
-
-    /**
-     * @param name the file name (one of {@link #FILES}).
-     * @return the cached configuration, or {@code null} if not loaded.
-     */
+    /** @return the cached configuration, or {@code null} if not loaded. */
     public @Nullable FileConfiguration config(@NotNull final String name) {
         return configs.get(name);
     }
 
+    private @NotNull FileConfiguration require(@NotNull final String name) {
+        final FileConfiguration c = configs.get(name);
+        return c != null ? c : new YamlConfiguration();
+    }
+
     /**
-     * Convenience accessor for a message string with MiniMessage formatting.
-     *
-     * @param key the dotted key.
-     * @return the raw string (defaults to the key if missing).
+     * @param key the dotted key in messages.yml.
+     * @return the raw MiniMessage template, or the key itself if missing.
      */
     public @NotNull String message(@NotNull final String key) {
         final FileConfiguration m = configs.get("messages.yml");
         if (m == null) {
             return key;
         }
-        return m.getString(key, key);
+        // getString(path) consults the bundled defaults; getString(path, def) would not,
+        // so keys added in an update would show up raw on servers with an older file.
+        final String value = m.getString(key);
+        return value != null ? value : key;
+    }
+
+    /** @return a list message (one line per entry); a plain string becomes one line. */
+    public @NotNull java.util.List<String> messageList(@NotNull final String key) {
+        final FileConfiguration m = configs.get("messages.yml");
+        if (m == null) {
+            return java.util.List.of(key);
+        }
+        if (m.isList(key)) {
+            return m.getStringList(key);
+        }
+        final String single = m.getString(key);
+        return java.util.List.of(single != null ? single : key);
     }
 
     public @NotNull Settings.GeneralSettings general() { return general; }
@@ -146,46 +144,69 @@ public final class ConfigManager {
 
     public void setAutoRegenOnExplosion(final boolean enabled) {
         setAndSave("config.yml", "auto-regen.on-explosion", enabled);
-        setAndSave("performance.yml", "auto-match-regen", enabled);
-        this.general = Settings.GeneralSettings.from(config("config.yml"));
-        this.performance = Settings.PerformanceSettings.from(config("performance.yml"));
+        this.general = Settings.GeneralSettings.from(require("config.yml"));
     }
 
     public void setAutoRegenOnFire(final boolean enabled) {
         setAndSave("config.yml", "auto-regen.on-fire", enabled);
-        this.general = Settings.GeneralSettings.from(config("config.yml"));
+        this.general = Settings.GeneralSettings.from(require("config.yml"));
     }
 
     public void setParticlesEnabled(final boolean enabled) {
         setAndSave("particles.yml", "enabled", enabled);
-        this.particles = Settings.ParticleSettings.from(config("particles.yml"));
+        this.particles = Settings.ParticleSettings.from(require("particles.yml"));
     }
 
     public void setRegenSpeedPercent(final int percent) {
-        final int clamped = Math.max(10, Math.min(500, percent));
-        setAndSave("performance.yml", "regen-speed-percent", clamped);
-        this.performance = Settings.PerformanceSettings.from(config("performance.yml"));
+        setAndSave("performance.yml", "regen-speed-percent", Math.max(10, Math.min(500, percent)));
+        this.performance = Settings.PerformanceSettings.from(require("performance.yml"));
     }
 
     private void setAndSave(@NotNull final String fileName, @NotNull final String path, @NotNull final Object value) {
         final FileConfiguration c = configs.get(fileName);
         if (c == null) return;
-        c.set(path, value);
-        try {
-            c.save(file(fileName));
-        } catch (final java.io.IOException e) {
-            plugin.getSLF4JLogger().error("Could not save {}", fileName, e);
+        if (unparsable.contains(fileName)) {
+            plugin.getSLF4JLogger().warn("Not saving {}: it has YAML errors. Fix it and run /ardx reload.", fileName);
+            c.set(path, value); // still apply in memory for this session
+            return;
+        }
+        synchronized (writeLock) {
+            c.set(path, value);
+            writeAtomically(fileName, c.saveToString());
         }
     }
 
     /**
-     * @return the data folder, creating it if necessary.
+     * Atomically replace a file in the data folder with {@code content}.
+     *
+     * @return true on success.
      */
+    public boolean writeAtomically(@NotNull final String fileName, @NotNull final String content) {
+        if (unparsable.contains(fileName)) {
+            plugin.getSLF4JLogger().error("Refusing to overwrite {}: it had YAML errors at load. Fix it and restart.", fileName);
+            return false;
+        }
+        final Path target = file(fileName).toPath();
+        final Path tmp = target.resolveSibling(fileName + ".tmp");
+        try {
+            Files.writeString(tmp, content, StandardCharsets.UTF_8);
+            try {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (final AtomicMoveNotSupportedException e) {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return true;
+        } catch (final IOException e) {
+            plugin.getSLF4JLogger().error("Could not save {}", fileName, e);
+            return false;
+        }
+    }
+
+    /** @return the data folder, creating it if necessary. */
     @NotNull File dataFolder() {
         final File dir = plugin.getDataFolder();
-        if (!dir.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            dir.mkdirs();
+        if (!dir.exists() && !dir.mkdirs()) {
+            plugin.getSLF4JLogger().error("Could not create data folder {}", dir.getAbsolutePath());
         }
         return dir;
     }
@@ -194,29 +215,19 @@ public final class ConfigManager {
         return new File(dataFolder(), name);
     }
 
-    /**
-     * Load a user config file, merged over the bundled default inside the jar.
-     */
+    /** Load a user config file with the bundled jar copy as defaults. */
     private @NotNull FileConfiguration loadWithDefaults(@NotNull final String name) {
-        // Extract default to disk if missing.
         final File disk = file(name);
         if (!disk.exists()) {
             try (InputStream in = plugin.getResource(name)) {
                 if (in != null) {
-                    //noinspection ResultOfMethodCallIgnored
-                    disk.getParentFile().mkdirs();
-                    java.nio.file.Files.copy(in, disk.toPath());
-                } else {
-                    // No bundled default — create an empty file.
-                    //noinspection ResultOfMethodCallIgnored
-                    disk.createNewFile();
+                    Files.copy(in, disk.toPath());
                 }
-            } catch (final java.io.IOException e) {
-                plugin.getSLF4JLogger().error("Could not extract default config: {}", name, e);
+            } catch (final IOException e) {
+                plugin.getSLF4JLogger().error("Could not extract default config {}", name, e);
             }
         }
 
-        // Load the bundled default from the jar (for merge baseline).
         final YamlConfiguration defaults = new YamlConfiguration();
         try (InputStream in = plugin.getResource(name)) {
             if (in != null) {
@@ -228,16 +239,18 @@ public final class ConfigManager {
             plugin.getSLF4JLogger().warn("Could not load bundled default for {}", name, e);
         }
 
-        // Load the user file.
         final YamlConfiguration user = new YamlConfiguration();
-        try {
-            user.load(disk);
-        } catch (final Exception e) {
-            plugin.getSLF4JLogger().error("Could not load {} — using defaults only", name, e);
+        unparsable.remove(name);
+        if (disk.exists()) {
+            try {
+                user.load(disk);
+            } catch (final Exception e) {
+                unparsable.add(name);
+                plugin.getSLF4JLogger().error("Could not parse {} - using bundled defaults. Fix the YAML and run /ardx reload.",
+                        name, e);
+            }
         }
-        // Merge: user values override defaults.
         user.setDefaults(defaults);
-        // Trigger options copy so missing keys get written back on next save.
         return user;
     }
 }

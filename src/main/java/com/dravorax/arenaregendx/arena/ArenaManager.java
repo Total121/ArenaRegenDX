@@ -1,6 +1,7 @@
 /*
- * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * ArenaRegenDX - High-performance arena regeneration
+ * Copyright (C) 2026 DravoraX. All rights reserved.
+ * Licensed exclusively to DravoraX.
  */
 
 package com.dravorax.arenaregendx.arena;
@@ -9,51 +10,63 @@ import com.dravorax.arenaregendx.ArenaRegenDXPlugin;
 import com.dravorax.arenaregendx.config.ConfigManager;
 import com.dravorax.arenaregendx.regen.RegenSpeed;
 import com.dravorax.arenaregendx.scheduler.SchedulerAdapter;
-import com.dravorax.arenaregendx.snapshot.SnapshotMetadata;
 import com.dravorax.arenaregendx.snapshot.SnapshotManager;
+import com.dravorax.arenaregendx.snapshot.SnapshotMetadata;
+import com.dravorax.arenaregendx.snapshot.SnapshotSerializer;
+import com.dravorax.arenaregendx.util.ColorUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
  * CRUD manager for {@link Arena} instances.
  *
- * <p>Arena metadata is persisted to {@code arenas.yml} and loaded into an
- * in-memory concurrent map at startup. Mutations are written through to disk
- * asynchronously (no main-thread file IO).</p>
- *
- * <p>When an arena is created with an auto-reset interval, a repeating task
- * is started that broadcasts countdown messages and triggers regeneration
- * when the timer reaches zero.</p>
+ * <p>The in-memory map is the source of truth. {@code arenas.yml} is read once
+ * on enable and rewritten as a whole from memory whenever something changes.
+ * Writes are coalesced (many changes in one tick produce one write), run off
+ * the server thread, and are atomic (temp file + move).</p>
  *
  * @author DravoraX
  * @since 1.0.0
  */
 public final class ArenaManager {
 
+    private static final List<String> FILE_HEADER = List.of(
+            "ArenaRegenDX - arena metadata.",
+            "This file is written by the plugin. Edit arenas with /ardx commands;",
+            "manual edits made while the server runs are overwritten.");
+
     private final ArenaRegenDXPlugin plugin;
     private final ConfigManager configManager;
     private final SnapshotManager snapshotManager;
     private final SchedulerAdapter scheduler;
 
+    /** Keyed by sanitized (lowercase) arena name. */
     private final ConcurrentMap<String, Arena> arenas = new ConcurrentHashMap<>();
+    /** Per-world arrays for the hot {@link #findContaining} lookup (block events). */
+    private volatile Map<String, Arena[]> byWorld = Map.of();
 
-    /** Serializes all arenas.yml mutations to prevent lost updates. */
-    private final Object arenaIoLock = new Object();
+    private final Object ioLock = new Object();
+    private final AtomicBoolean flushQueued = new AtomicBoolean(false);
 
     public ArenaManager(@NotNull final ArenaRegenDXPlugin plugin,
                         @NotNull final ConfigManager configManager,
@@ -65,53 +78,55 @@ public final class ArenaManager {
         this.scheduler = scheduler;
     }
 
-    /**
-     * Async initialization: load arena metadata from arenas.yml.
-     */
-    public void initializeAsync() {
-        scheduler.runAsync(this::loadFromDisk);
-    }
+    // -----------------------------------------------------------------------
+    // Loading / persistence
+    // -----------------------------------------------------------------------
 
     /**
-     * Load all arenas from arenas.yml into memory.
+     * Load all arenas from {@code arenas.yml}. Runs synchronously during enable
+     * (the YAML is already parsed), so commands, placeholders and listeners
+     * never observe a half-loaded arena list.
      */
-    private void loadFromDisk() {
+    public void load() {
         final FileConfiguration cfg = configManager.config("arenas.yml");
-        if (cfg == null) {
-            return;
-        }
-        final ConfigurationSection root = cfg.getConfigurationSection("arenas");
+        final ConfigurationSection root = cfg == null ? null : cfg.getConfigurationSection("arenas");
         if (root == null) {
             plugin.getSLF4JLogger().info("No arenas defined yet.");
             return;
         }
         int count = 0;
-        for (final String name : root.getKeys(false)) {
-            final ConfigurationSection a = root.getConfigurationSection(name);
+        for (final String rawName : root.getKeys(false)) {
+            final ConfigurationSection a = root.getConfigurationSection(rawName);
             if (a == null) continue;
             try {
-                final ArenaStatus loadedStatus;
-                try {
-                    loadedStatus = ArenaStatus.valueOf(a.getString("status", "EMPTY"));
-                } catch (final IllegalArgumentException ex) {
-                    throw new IllegalArgumentException("Bad status for arena " + name, ex);
+                final String name = ColorUtil.sanitizeName(rawName);
+                if (!ColorUtil.isValidName(name)) {
+                    plugin.getSLF4JLogger().warn("Skipping arena '{}': invalid name.", rawName);
+                    continue;
                 }
-                // Coerce stuck in-flight statuses from a previous crash/shutdown.
-                final ArenaStatus status = (loadedStatus == ArenaStatus.REGENERATING
-                        || loadedStatus == ArenaStatus.SAVING)
-                        ? (a.getLong("latest-snapshot", 0) > 0 ? ArenaStatus.READY : ArenaStatus.EMPTY)
-                        : loadedStatus;
+                ArenaStatus status;
+                try {
+                    status = ArenaStatus.valueOf(a.getString("status", "EMPTY").toUpperCase(Locale.ROOT));
+                } catch (final IllegalArgumentException ex) {
+                    status = ArenaStatus.EMPTY;
+                }
+                final long latest = a.getLong("latest-snapshot", 0);
+                // In-flight states cannot survive a restart.
+                if (status == ArenaStatus.REGENERATING || status == ArenaStatus.SAVING) {
+                    status = latest > 0 ? ArenaStatus.READY : ArenaStatus.EMPTY;
+                }
                 final Arena arena = new Arena(
                         name,
                         a.getString("world", ""),
                         a.getInt("origin.x"), a.getInt("origin.y"), a.getInt("origin.z"),
-                        a.getInt("size.x"), a.getInt("size.y"), a.getInt("size.z"),
+                        Math.max(1, a.getInt("size.x", 1)), Math.max(1, a.getInt("size.y", 1)),
+                        Math.max(1, a.getInt("size.z", 1)),
                         a.getLong("created-at", System.currentTimeMillis()),
-                        a.getLong("latest-snapshot", 0),
+                        latest,
                         a.getLong("last-regenerated", 0),
                         a.getLong("snapshot-count", 0),
                         status,
-                        a.getInt("auto-reset", 0),
+                        Math.max(0, a.getInt("auto-reset", 0)),
                         a.getBoolean("async-regen", true),
                         a.getBoolean("spawn.set", false),
                         a.getDouble("spawn.x", 0), a.getDouble("spawn.y", 64), a.getDouble("spawn.z", 0),
@@ -119,245 +134,60 @@ public final class ArenaManager {
                 );
                 loadExclusions(arena, a);
                 arena.setRegenSpeedPercent(a.getInt("regen-speed-percent", RegenSpeed.INHERIT));
-                arenas.put(name, arena);
+                if (arenas.putIfAbsent(name, arena) != null) {
+                    plugin.getSLF4JLogger().warn("Duplicate arena '{}' in arenas.yml ignored.", rawName);
+                    continue;
+                }
                 count++;
             } catch (final Exception e) {
-                plugin.getSLF4JLogger().warn("Skipping malformed arena entry: {}", name, e);
+                plugin.getSLF4JLogger().warn("Skipping malformed arena entry '{}'", rawName, e);
             }
         }
-        plugin.getSLF4JLogger().info("Loaded {} arena(s) from arenas.yml.", count);
-        // Countdowns must start only after arenas are in memory.
-        try {
-            plugin.autoResetManager().initializeAll();
-        } catch (final Throwable t) {
-            plugin.getSLF4JLogger().warn("Auto-reset initializeAll failed after arena load", t);
-        }
+        rebuildIndex();
+        plugin.getSLF4JLogger().info("Loaded {} arena(s).", count);
     }
 
-    /**
-     * Create a new arena from a selection.
-     *
-     * @param name the arena name.
-     * @param world the world.
-     * @param pos1  corner 1.
-     * @param pos2  corner 2.
-     * @param autoResetInterval auto-reset interval in seconds (0 = disabled).
-     * @param asyncRegen whether to use async regen.
-     * @return the created arena.
-     * @throws IllegalArgumentException if the name is taken or invalid.
-     */
-    public @NotNull Arena createArena(@NotNull final String name, @NotNull final World world,
-                                      @NotNull final Location pos1, @NotNull final Location pos2,
-                                      final int autoResetInterval, final boolean asyncRegen) {
-        final String sanitized = com.dravorax.arenaregendx.util.ColorUtil.sanitizeName(name);
-        if (sanitized.isEmpty()) {
-            throw new IllegalArgumentException("Invalid arena name: " + name);
-        }
-        final int minX = Math.min(pos1.getBlockX(), pos2.getBlockX());
-        final int minY = Math.min(pos1.getBlockY(), pos2.getBlockY());
-        final int minZ = Math.min(pos1.getBlockZ(), pos2.getBlockZ());
-        final int sizeX = Math.abs(pos1.getBlockX() - pos2.getBlockX()) + 1;
-        final int sizeY = Math.abs(pos1.getBlockY() - pos2.getBlockY()) + 1;
-        final int sizeZ = Math.abs(pos1.getBlockZ() - pos2.getBlockZ()) + 1;
-        final Arena arena = new Arena(sanitized, world.getName(), minX, minY, minZ,
-                sizeX, sizeY, sizeZ, System.currentTimeMillis(),
-                0L, 0L, 0L, ArenaStatus.EMPTY,
-                autoResetInterval, asyncRegen,
-                false, 0, 64, 0, 0, 0);
-        if (arenas.putIfAbsent(sanitized, arena) != null) {
-            throw new IllegalArgumentException("Arena already exists: " + sanitized);
-        }
-        saveArena(arena);
-        return arena;
-    }
-
-    /**
-     * Rename an arena. Moves the arena entry, renames its snapshot directory,
-     * and updates all metadata.
-     *
-     * @param oldName the current name.
-     * @param newName the new name (will be sanitized).
-     * @return true if renamed successfully.
-     * @throws IllegalArgumentException if oldName doesn't exist or newName is taken.
-     */
-    public boolean renameArena(@NotNull final String oldName, @NotNull final String newName) {
-        final Arena old = arenas.get(oldName);
-        if (old == null) {
-            throw new IllegalArgumentException("Arena not found: " + oldName);
-        }
-        final String sanitized = com.dravorax.arenaregendx.util.ColorUtil.sanitizeName(newName);
-        if (sanitized.isEmpty()) {
-            throw new IllegalArgumentException("Invalid name: " + newName);
-        }
-        if (arenas.containsKey(sanitized)) {
-            throw new IllegalArgumentException("Arena already exists: " + sanitized);
-        }
-        final java.io.File newDir = new java.io.File(plugin.getDataFolder(), "snapshots/" + sanitized);
-        if (newDir.exists()) {
-            throw new IllegalArgumentException("Snapshot directory already exists for: " + sanitized);
-        }
-        // Cancel in-flight restore before touching identity / disk.
-        try {
-            plugin.regenManager().cancel(oldName);
-        } catch (final Throwable t) {
-            plugin.getSLF4JLogger().warn("Could not cancel regen before rename of {}", oldName, t);
-        }
-        try {
-            plugin.autoResetManager().stopCountdown(oldName);
-        } catch (final Throwable t) {
-            plugin.getSLF4JLogger().debug("stopCountdown during rename failed", t);
-        }
-        plugin.changeTracker().clear(oldName);
-        if (plugin.blockInteractListener() != null) {
-            plugin.blockInteractListener().clearTrigger(oldName);
-        }
-
-        final ArenaStatus status = (old.status() == ArenaStatus.REGENERATING || old.status() == ArenaStatus.SAVING)
-                ? ArenaStatus.READY : old.status();
-        final Arena renamed = new Arena(sanitized, old.worldName(),
-                old.originX(), old.originY(), old.originZ(),
-                old.sizeX(), old.sizeY(), old.sizeZ(),
-                old.createdAt(), old.latestSnapshotId(),
-                old.lastRegeneratedAt(), old.snapshotCount(), status,
-                old.autoResetInterval(), old.asyncRegen(),
-                old.hasSpawn(), old.spawnX(), old.spawnY(), old.spawnZ(),
-                old.spawnYaw(), old.spawnPitch());
-        renamed.setExclusions(old.exclusions());
-        renamed.setRegenSpeedPercent(old.regenSpeedPercent());
-        // Reserve the new name before touching disk so a failed rename never
-        // leaves snapshots under a name that is missing from the arena map.
-        if (arenas.putIfAbsent(sanitized, renamed) != null) {
-            throw new IllegalArgumentException("Arena already exists: " + sanitized);
-        }
-        final boolean moved = snapshotManager.renameSnapshotDirectory(oldName, sanitized);
-        if (!moved) {
-            arenas.remove(sanitized, renamed);
-            throw new IllegalStateException("Failed to rename snapshot directory " + oldName + " → " + sanitized);
-        }
-        snapshotManager.remapArenaName(oldName, sanitized);
-        arenas.remove(oldName);
-
-        scheduler.runAsync(() -> {
-            synchronized (arenaIoLock) {
-                final FileConfiguration cfg = configManager.config("arenas.yml");
-                if (cfg != null) {
-                    cfg.set("arenas." + oldName, null);
-                    writeArenaFields(cfg, renamed);
-                    configManager.saveArenas(cfg);
-                }
-            }
-        });
-        if (renamed.autoResetInterval() > 0 && renamed.latestSnapshotId() > 0) {
-            try {
-                plugin.autoResetManager().startCountdown(renamed);
-            } catch (final Throwable t) {
-                plugin.getSLF4JLogger().debug("startCountdown after rename failed", t);
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Delete an arena and all its snapshots.
-     * Cancels regen / auto-reset / dirty tracking before removing identity.
-     */
-    public boolean deleteArena(@NotNull final String name) {
-        final Arena existing = getArena(name);
-        if (existing == null) {
-            return false;
-        }
-        final String key = existing.name();
-        try {
-            plugin.regenManager().cancel(key);
-        } catch (final Throwable t) {
-            plugin.getSLF4JLogger().warn("Could not cancel regen before delete of {}", key, t);
-        }
-        try {
-            plugin.autoResetManager().stopCountdown(key);
-        } catch (final Throwable t) {
-            plugin.getSLF4JLogger().debug("stopCountdown during delete failed", t);
-        }
-        plugin.changeTracker().clear(key);
-        if (plugin.blockInteractListener() != null) {
-            plugin.blockInteractListener().clearTrigger(key);
-        }
-        final Arena removed = arenas.remove(key);
-        if (removed == null) {
-            return false;
-        }
-        snapshotManager.deleteAllSnapshots(key);
-        scheduler.runAsync(() -> {
-            synchronized (arenaIoLock) {
-                final FileConfiguration cfg = configManager.config("arenas.yml");
-                if (cfg != null) {
-                    cfg.set("arenas." + key, null);
-                    configManager.saveArenas(cfg);
-                }
-            }
-        });
-        return true;
-    }
-
-    /**
-     * Synchronous in-memory lookup.
-     */
-    public @Nullable Arena getArena(@NotNull final String name) {
-        final Arena exact = arenas.get(name);
-        if (exact != null) return exact;
-        final String sanitized = com.dravorax.arenaregendx.util.ColorUtil.sanitizeName(name);
-        return arenas.get(sanitized);
-    }
-
-    /**
-     * Async lookup.
-     */
-    public @NotNull CompletableFuture<Optional<Arena>> getArenaAsync(@NotNull final String name) {
-        return CompletableFuture.completedFuture(Optional.ofNullable(getArena(name)));
-    }
-
-    /**
-     * @return a snapshot of all known arenas.
-     */
-    public @NotNull Collection<Arena> all() {
-        return new ArrayList<>(arenas.values());
-    }
-
-    /**
-     * First arena whose cuboid contains this voxel, or {@code null}.
-     */
-    public @Nullable Arena findContaining(@NotNull final String world, final int x, final int y, final int z) {
-        for (final Arena arena : arenas.values()) {
-            if (arena.worldName().equals(world) && arena.contains(x, y, z)) {
-                return arena;
-            }
-        }
-        return null;
-    }
-
-    public int count() {
-        return arenas.size();
-    }
-
-    /**
-     * Persist a single arena's metadata to arenas.yml (async).
-     */
+    /** Persist one arena's change. Coalesced: the whole file is rewritten at most once per burst. */
     public void saveArena(@NotNull final Arena arena) {
-        scheduler.runAsync(() -> {
-            synchronized (arenaIoLock) {
-                // Never resurrect a deleted arena after a raced cancel/save.
-                if (!arenas.containsKey(arena.name())) {
-                    return;
-                }
-                final FileConfiguration cfg = configManager.config("arenas.yml");
-                if (cfg == null) return;
-                writeArenaFields(cfg, arena);
-                configManager.saveArenas(cfg);
-            }
-        });
+        requestFlush();
     }
 
-    private void writeArenaFields(@NotNull final FileConfiguration cfg, @NotNull final Arena arena) {
+    /** Schedule an async rewrite of arenas.yml unless one is already queued. */
+    public void requestFlush() {
+        if (flushQueued.compareAndSet(false, true)) {
+            try {
+                scheduler.runAsync(() -> {
+                    flushQueued.set(false);
+                    flushNow();
+                });
+            } catch (final Throwable t) {
+                // Plugin disabling: schedulers refuse new tasks, so write now.
+                flushQueued.set(false);
+                flushNow();
+            }
+        }
+    }
+
+    /** Synchronously rewrite arenas.yml from memory. */
+    public void flushNow() {
+        synchronized (ioLock) {
+            final YamlConfiguration out = new YamlConfiguration();
+            out.options().setHeader(FILE_HEADER);
+            final List<Arena> sorted = new ArrayList<>(arenas.values());
+            sorted.sort((a, b) -> a.name().compareTo(b.name()));
+            out.createSection("arenas");
+            for (final Arena arena : sorted) {
+                writeArenaFields(out, arena);
+            }
+            configManager.writeAtomically("arenas.yml", out.saveToString());
+        }
+    }
+
+    private static void writeArenaFields(@NotNull final FileConfiguration cfg, @NotNull final Arena arena) {
         final String base = "arenas." + arena.name();
+        final ArenaStatus status = arena.status() == ArenaStatus.REGENERATING || arena.status() == ArenaStatus.SAVING
+                ? (arena.latestSnapshotId() > 0 ? ArenaStatus.READY : ArenaStatus.EMPTY)
+                : arena.status();
         cfg.set(base + ".world", arena.worldName());
         cfg.set(base + ".origin.x", arena.originX());
         cfg.set(base + ".origin.y", arena.originY());
@@ -369,7 +199,7 @@ public final class ArenaManager {
         cfg.set(base + ".latest-snapshot", arena.latestSnapshotId());
         cfg.set(base + ".last-regenerated", arena.lastRegeneratedAt());
         cfg.set(base + ".snapshot-count", arena.snapshotCount());
-        cfg.set(base + ".status", arena.status().name());
+        cfg.set(base + ".status", status.name());
         cfg.set(base + ".auto-reset", arena.autoResetInterval());
         cfg.set(base + ".async-regen", arena.asyncRegen());
         cfg.set(base + ".regen-speed-percent", arena.regenSpeedPercent());
@@ -379,101 +209,9 @@ public final class ArenaManager {
         cfg.set(base + ".spawn.z", arena.spawnZ());
         cfg.set(base + ".spawn.yaw", (double) arena.spawnYaw());
         cfg.set(base + ".spawn.pitch", (double) arena.spawnPitch());
-        writeExclusions(cfg, base, arena);
-    }
-
-    /**
-     * Get all players inside an arena's cuboid.
-     *
-     * <p>Uses {@link Bukkit#getOnlinePlayers()} instead of {@code World#getPlayers()}
-     * so Folia does not require owning the world's player list from a foreign region.
-     * Location reads still hop via {@link #forEachPlayerInArena} for mutating work.</p>
-     */
-    public @NotNull List<Player> playersInArena(@NotNull final Arena arena) {
-        final List<Player> result = new ArrayList<>();
-        final String worldName = arena.worldName();
-        for (final Player p : Bukkit.getOnlinePlayers()) {
-            try {
-                if (!worldName.equals(p.getWorld().getName())) {
-                    continue;
-                }
-                final Location loc = p.getLocation();
-                if (arena.contains(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ())) {
-                    result.add(p);
-                }
-            } catch (final Throwable t) {
-                plugin.getSLF4JLogger().debug("playersInArena skip {}", p.getName(), t);
-            }
+        for (final ExclusionZone zone : arena.exclusions()) {
+            zone.writeTo(cfg.createSection(base + ".exclusions." + zone.name()));
         }
-        return result;
-    }
-
-    /**
-     * Folia-safe iteration: each matching player is visited on their entity scheduler
-     * before containment is re-checked and {@code action} runs.
-     */
-    public void forEachPlayerInArena(@NotNull final Arena arena,
-                                     @NotNull final java.util.function.Consumer<Player> action) {
-        final String worldName = arena.worldName();
-        for (final Player p : Bukkit.getOnlinePlayers()) {
-            try {
-                if (!worldName.equals(p.getWorld().getName())) {
-                    continue;
-                }
-            } catch (final Throwable ignored) {
-                continue;
-            }
-            scheduler.runAtEntity(p, () -> {
-                try {
-                    if (!p.isOnline()) return;
-                    if (!worldName.equals(p.getWorld().getName())) return;
-                    final Location loc = p.getLocation();
-                    if (arena.contains(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ())) {
-                        action.accept(p);
-                    }
-                } catch (final Throwable t) {
-                    plugin.getSLF4JLogger().debug("forEachPlayerInArena failed for {}", p.getName(), t);
-                }
-            });
-        }
-    }
-
-    /**
-     * Refresh the snapshot count + latest id for an arena.
-     */
-    public void refreshSnapshotStats(@NotNull final String arenaName) {
-        snapshotManager.listSnapshots(arenaName).thenAccept(list -> {
-            final Arena arena = arenas.get(arenaName);
-            if (arena == null) return;
-            long maxId = 0;
-            for (final SnapshotMetadata m : list) {
-                if (m.snapshotId() > maxId) maxId = m.snapshotId();
-            }
-            arena.onSnapshotSaved(maxId);
-            saveArena(arena);
-        });
-    }
-
-    /**
-     * Shutdown: persist all arenas.
-     */
-    public void shutdown() {
-        synchronized (arenaIoLock) {
-            final FileConfiguration cfg = configManager.config("arenas.yml");
-            if (cfg == null) {
-                plugin.getSLF4JLogger().warn("arenas.yml unavailable during shutdown persist");
-                return;
-            }
-            for (final Arena arena : arenas.values()) {
-                // Never persist transient in-flight statuses across restarts.
-                if (arena.status() == ArenaStatus.REGENERATING || arena.status() == ArenaStatus.SAVING) {
-                    arena.setStatus(ArenaStatus.READY);
-                }
-                writeArenaFields(cfg, arena);
-            }
-            configManager.saveArenas(cfg);
-        }
-        plugin.getSLF4JLogger().info("Arena metadata persisted ({} arenas).", arenas.size());
     }
 
     private static void loadExclusions(@NotNull final Arena arena, @NotNull final ConfigurationSection section) {
@@ -491,13 +229,283 @@ public final class ArenaManager {
         }
     }
 
-    private static void writeExclusions(@NotNull final FileConfiguration cfg,
-                                        @NotNull final String base,
-                                        @NotNull final Arena arena) {
-        cfg.set(base + ".exclusions", null);
-        for (final ExclusionZone zone : arena.exclusions()) {
-            final ConfigurationSection z = cfg.createSection(base + ".exclusions." + zone.name());
-            zone.writeTo(z);
+    // -----------------------------------------------------------------------
+    // CRUD
+    // -----------------------------------------------------------------------
+
+    /**
+     * Create a new arena from two corners (no snapshot yet; see {@link #captureSnapshot}).
+     *
+     * @throws IllegalArgumentException if the name is invalid / taken or the region is invalid.
+     */
+    public @NotNull Arena createArena(@NotNull final String name, @NotNull final World world,
+                                      @NotNull final Location pos1, @NotNull final Location pos2,
+                                      final int autoResetInterval, final boolean asyncRegen) {
+        final String sanitized = ColorUtil.sanitizeName(name);
+        if (!ColorUtil.isValidName(sanitized)) {
+            throw new IllegalArgumentException("Invalid arena name '" + name
+                    + "'. Use 1-" + ColorUtil.MAX_NAME_LENGTH + " characters: a-z, 0-9, - and _.");
         }
+        final int minX = Math.min(pos1.getBlockX(), pos2.getBlockX());
+        final int minY = Math.min(pos1.getBlockY(), pos2.getBlockY());
+        final int minZ = Math.min(pos1.getBlockZ(), pos2.getBlockZ());
+        final int maxY = Math.max(pos1.getBlockY(), pos2.getBlockY());
+        final int sizeX = Math.abs(pos1.getBlockX() - pos2.getBlockX()) + 1;
+        final int sizeY = maxY - minY + 1;
+        final int sizeZ = Math.abs(pos1.getBlockZ() - pos2.getBlockZ()) + 1;
+        if (minY < world.getMinHeight() || maxY >= world.getMaxHeight()) {
+            throw new IllegalArgumentException("Selection Y " + minY + ".." + maxY + " is outside the world height ("
+                    + world.getMinHeight() + ".." + (world.getMaxHeight() - 1) + ").");
+        }
+        final long volume = (long) sizeX * sizeY * sizeZ;
+        if (volume > SnapshotSerializer.MAX_VOLUME) {
+            throw new IllegalArgumentException("Selection is " + volume + " blocks; the maximum is "
+                    + SnapshotSerializer.MAX_VOLUME + ".");
+        }
+        final Arena arena = new Arena(sanitized, world.getName(), minX, minY, minZ,
+                sizeX, sizeY, sizeZ, System.currentTimeMillis(),
+                0L, 0L, 0L, ArenaStatus.EMPTY,
+                Math.max(0, autoResetInterval), asyncRegen,
+                false, 0, 64, 0, 0, 0);
+        if (arenas.putIfAbsent(sanitized, arena) != null) {
+            throw new IllegalArgumentException("Arena already exists: " + sanitized);
+        }
+        rebuildIndex();
+        requestFlush();
+        return arena;
+    }
+
+    /**
+     * Capture a fresh snapshot of an arena and make it the active restore point.
+     * Single implementation shared by commands, GUI and the public API.
+     *
+     * @return a future completed with the metadata once the snapshot is on disk.
+     */
+    public @NotNull CompletableFuture<SnapshotMetadata> captureSnapshot(@NotNull final Arena arena) {
+        final World world = Bukkit.getWorld(arena.worldName());
+        if (world == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException("World not loaded: " + arena.worldName()));
+        }
+        if (plugin.regenManager().isRegenerating(arena.name())) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Arena " + arena.name() + " is regenerating; cancel it or wait."));
+        }
+        if (!arena.beginSaving()) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Arena " + arena.name() + " is busy (" + arena.status().name().toLowerCase(Locale.ROOT) + ")."));
+        }
+        final Location min = new Location(world, arena.originX(), arena.originY(), arena.originZ());
+        final Location max = new Location(world,
+                arena.originX() + arena.sizeX() - 1,
+                arena.originY() + arena.sizeY() - 1,
+                arena.originZ() + arena.sizeZ() - 1);
+        // Changes after this point are tracked relative to the new snapshot.
+        plugin.changeTracker().reset(arena);
+        final CompletableFuture<SnapshotMetadata> future;
+        try {
+            future = snapshotManager.saveSnapshot(arena.name(), world, min, max);
+        } catch (final Throwable t) {
+            arena.endSaving(false);
+            plugin.changeTracker().forget(arena.name());
+            return CompletableFuture.failedFuture(t);
+        }
+        return future.whenComplete((meta, err) -> {
+            if (arenas.get(arena.name()) != arena) {
+                return; // deleted or renamed while saving
+            }
+            if (err != null) {
+                plugin.changeTracker().forget(arena.name());
+                arena.endSaving(false);
+            } else {
+                arena.onSnapshotSaved(meta.snapshotId());
+                arena.endSaving(true);
+                snapshotManager.pruneOldSnapshots(arena.name(), meta.snapshotId());
+            }
+            requestFlush();
+        });
+    }
+
+    /**
+     * Make an existing snapshot the one future restores use (for {@code /ardx load}).
+     */
+    public @NotNull CompletableFuture<Void> selectSnapshot(@NotNull final Arena arena, final long snapshotId) {
+        return snapshotManager.loadSnapshot(arena.name(), snapshotId).thenAccept(snapshot -> {
+            if (snapshot.sizeX() != arena.sizeX() || snapshot.sizeY() != arena.sizeY()
+                    || snapshot.sizeZ() != arena.sizeZ()) {
+                throw new IllegalStateException("Snapshot #" + snapshotId + " is "
+                        + snapshot.sizeX() + "x" + snapshot.sizeY() + "x" + snapshot.sizeZ()
+                        + " but the arena is " + arena.sizeX() + "x" + arena.sizeY() + "x" + arena.sizeZ() + ".");
+            }
+            if (arena.latestSnapshotId() != snapshotId) {
+                arena.selectSnapshot(snapshotId);
+                // Dirty voxels were relative to the previous snapshot.
+                plugin.changeTracker().forget(arena.name());
+                requestFlush();
+            }
+        });
+    }
+
+    /**
+     * Rename an arena, moving its snapshots and runtime state.
+     *
+     * @throws IllegalArgumentException for unknown / taken / invalid names.
+     * @throws IllegalStateException if the snapshot directory cannot be moved.
+     */
+    public boolean renameArena(@NotNull final String oldName, @NotNull final String newName) {
+        final Arena old = getArena(oldName);
+        if (old == null) {
+            throw new IllegalArgumentException("Arena not found: " + oldName);
+        }
+        final String sanitized = ColorUtil.sanitizeName(newName);
+        if (!ColorUtil.isValidName(sanitized)) {
+            throw new IllegalArgumentException("Invalid name: " + newName);
+        }
+        if (arenas.containsKey(sanitized)) {
+            throw new IllegalArgumentException("Arena already exists: " + sanitized);
+        }
+        if (old.status() == ArenaStatus.SAVING) {
+            throw new IllegalArgumentException("Arena " + old.name() + " is saving a snapshot; try again shortly.");
+        }
+        final String from = old.name();
+        plugin.regenManager().cancel(from);
+        plugin.autoResetManager().stopCountdown(from);
+        plugin.changeTracker().forget(from);
+        if (plugin.blockInteractListener() != null) {
+            plugin.blockInteractListener().clearTrigger(from);
+        }
+
+        final ArenaStatus status = old.status() == ArenaStatus.REGENERATING ? ArenaStatus.READY : old.status();
+        final Arena renamed = new Arena(sanitized, old.worldName(),
+                old.originX(), old.originY(), old.originZ(),
+                old.sizeX(), old.sizeY(), old.sizeZ(),
+                old.createdAt(), old.latestSnapshotId(),
+                old.lastRegeneratedAt(), old.snapshotCount(), status,
+                old.autoResetInterval(), old.asyncRegen(),
+                old.hasSpawn(), old.spawnX(), old.spawnY(), old.spawnZ(),
+                old.spawnYaw(), old.spawnPitch());
+        renamed.setExclusions(old.exclusions());
+        renamed.setRegenSpeedPercent(old.regenSpeedPercent());
+        // Reserve the new name before touching disk.
+        if (arenas.putIfAbsent(sanitized, renamed) != null) {
+            throw new IllegalArgumentException("Arena already exists: " + sanitized);
+        }
+        if (!snapshotManager.renameSnapshotDirectory(from, sanitized)) {
+            arenas.remove(sanitized, renamed);
+            throw new IllegalStateException("Could not move snapshots of " + from + " to " + sanitized
+                    + " (see console).");
+        }
+        snapshotManager.remapArenaName(from, sanitized);
+        arenas.remove(from, old);
+        rebuildIndex();
+        requestFlush();
+        if (renamed.autoResetInterval() > 0 && renamed.latestSnapshotId() > 0) {
+            plugin.autoResetManager().startCountdown(renamed);
+        }
+        return true;
+    }
+
+    /** Delete an arena and all its snapshots. */
+    public boolean deleteArena(@NotNull final String name) {
+        final Arena existing = getArena(name);
+        if (existing == null) {
+            return false;
+        }
+        final String key = existing.name();
+        plugin.regenManager().cancel(key);
+        plugin.autoResetManager().stopCountdown(key);
+        plugin.changeTracker().forget(key);
+        if (plugin.blockInteractListener() != null) {
+            plugin.blockInteractListener().clearTrigger(key);
+        }
+        if (!arenas.remove(key, existing)) {
+            return false;
+        }
+        rebuildIndex();
+        snapshotManager.deleteAllSnapshots(key);
+        requestFlush();
+        return true;
+    }
+
+    /** Call after adding / removing exclusion zones. Dirty tracking ignored excluded voxels, so it restarts. */
+    public void onExclusionsChanged(@NotNull final Arena arena) {
+        plugin.changeTracker().forget(arena.name());
+        requestFlush();
+    }
+
+    // -----------------------------------------------------------------------
+    // Queries
+    // -----------------------------------------------------------------------
+
+    /** Lookup by name (case-insensitive; sanitized). */
+    public @Nullable Arena getArena(@NotNull final String name) {
+        final Arena exact = arenas.get(name);
+        if (exact != null) return exact;
+        return arenas.get(ColorUtil.sanitizeName(name));
+    }
+
+    /** @deprecated lookups are synchronous; use {@link #getArena(String)}. */
+    @Deprecated
+    public @NotNull CompletableFuture<Optional<Arena>> getArenaAsync(@NotNull final String name) {
+        return CompletableFuture.completedFuture(Optional.ofNullable(getArena(name)));
+    }
+
+    /** @return a copy of all known arenas. */
+    public @NotNull Collection<Arena> all() {
+        return new ArrayList<>(arenas.values());
+    }
+
+    public int count() {
+        return arenas.size();
+    }
+
+    /** First arena in {@code world} whose cuboid contains the voxel, or {@code null}. Hot path. */
+    public @Nullable Arena findContaining(@NotNull final String world, final int x, final int y, final int z) {
+        final Arena[] candidates = byWorld.get(world);
+        if (candidates == null) {
+            return null;
+        }
+        for (final Arena arena : candidates) {
+            if (arena.contains(x, y, z)) {
+                return arena;
+            }
+        }
+        return null;
+    }
+
+    private void rebuildIndex() {
+        final Map<String, List<Arena>> grouped = new HashMap<>();
+        for (final Arena arena : arenas.values()) {
+            grouped.computeIfAbsent(arena.worldName(), k -> new ArrayList<>()).add(arena);
+        }
+        final Map<String, Arena[]> index = new HashMap<>();
+        grouped.forEach((world, list) -> index.put(world, list.toArray(new Arena[0])));
+        this.byWorld = Map.copyOf(index);
+    }
+
+    /**
+     * Visit every online player inside the arena, on that player's own thread.
+     * Containment is re-checked on the player's thread before {@code action} runs.
+     */
+    public void forEachPlayerInArena(@NotNull final Arena arena, @NotNull final Consumer<Player> action) {
+        final String worldName = arena.worldName();
+        for (final Player p : Bukkit.getOnlinePlayers()) {
+            scheduler.runAtEntity(p, () -> {
+                if (!p.isOnline() || !worldName.equals(p.getWorld().getName())) {
+                    return;
+                }
+                final Location loc = p.getLocation();
+                if (arena.contains(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ())) {
+                    action.accept(p);
+                }
+            });
+        }
+    }
+
+    /**
+     * Shutdown: persist all arenas synchronously.
+     */
+    public void shutdown() {
+        flushNow();
+        plugin.getSLF4JLogger().info("Arena metadata persisted ({} arenas).", arenas.size());
     }
 }

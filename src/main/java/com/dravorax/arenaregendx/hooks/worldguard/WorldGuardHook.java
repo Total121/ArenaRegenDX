@@ -5,9 +5,7 @@
 
 package com.dravorax.arenaregendx.hooks.worldguard;
 
-import com.dravorax.arenaregendx.ArenaRegenDXPlugin;
 import com.dravorax.arenaregendx.arena.Arena;
-import com.dravorax.arenaregendx.arena.ArenaManager;
 import org.jetbrains.annotations.NotNull;
 
 /**
@@ -34,11 +32,12 @@ public final class WorldGuardHook {
      * @param plugin the plugin.
      * @param arenaManager the arena manager.
      */
-    public static void enable(@NotNull final ArenaRegenDXPlugin plugin,
-                              @NotNull final ArenaManager arenaManager) {
+    public static void enable() {
         enabled = true;
-        plugin.getSLF4JLogger().info("WorldGuard hook ready. Arena regions can be protected via "
-                + "the WorldGuard API (see developer docs).");
+    }
+
+    public static void disable() {
+        enabled = false;
     }
 
     /**

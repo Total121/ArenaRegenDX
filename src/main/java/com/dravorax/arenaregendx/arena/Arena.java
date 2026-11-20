@@ -41,6 +41,7 @@ public final class Arena {
 
     /** Protected volumes that regeneration must never rewrite. */
     private final CopyOnWriteArrayList<ExclusionZone> exclusions = new CopyOnWriteArrayList<>();
+    private volatile ExclusionIndex exclusionIndex;
 
     public Arena(@NotNull final String name, @NotNull final String worldName,
                  final int originX, final int originY, final int originZ,
@@ -106,27 +107,45 @@ public final class Arena {
         return sizeX * sizeY * sizeZ;
     }
 
-    public @NotNull List<ExclusionZone> exclusions() {
-        return exclusions;
+    /** @return true if the (fractional) point lies inside the arena cuboid. */
+    public boolean containsPoint(final double x, final double y, final double z) {
+        return x >= originX && x < originX + sizeX
+                && y >= originY && y < originY + sizeY
+                && z >= originZ && z < originZ + sizeZ;
     }
 
+    /** @return a read-only live view of the exclusion zones. */
+    public @NotNull List<ExclusionZone> exclusions() {
+        return java.util.Collections.unmodifiableList(exclusions);
+    }
+
+    /** Cached immutable index; rebuilt lazily after exclusions change. */
     public @NotNull ExclusionIndex exclusionIndex() {
-        return ExclusionIndex.of(exclusions);
+        ExclusionIndex index = exclusionIndex;
+        if (index == null) {
+            index = ExclusionIndex.of(exclusions);
+            exclusionIndex = index;
+        }
+        return index;
     }
 
     public void setExclusions(@NotNull final List<ExclusionZone> zones) {
         exclusions.clear();
         exclusions.addAll(zones);
+        exclusionIndex = null;
     }
 
-    public boolean addExclusion(@NotNull final ExclusionZone zone) {
+    public synchronized boolean addExclusion(@NotNull final ExclusionZone zone) {
         exclusions.removeIf(z -> z.name().equalsIgnoreCase(zone.name()));
         exclusions.add(zone);
+        exclusionIndex = null;
         return true;
     }
 
-    public boolean removeExclusion(@NotNull final String zoneName) {
-        return exclusions.removeIf(z -> z.name().equalsIgnoreCase(zoneName));
+    public synchronized boolean removeExclusion(@NotNull final String zoneName) {
+        final boolean removed = exclusions.removeIf(z -> z.name().equalsIgnoreCase(zoneName));
+        exclusionIndex = null;
+        return removed;
     }
 
     public @Nullable ExclusionZone exclusion(@NotNull final String zoneName) {
@@ -139,26 +158,60 @@ public final class Arena {
     }
 
     public boolean isExcluded(final int x, final int y, final int z) {
-        for (final ExclusionZone zone : exclusions) {
-            if (zone.contains(x, y, z)) {
-                return true;
-            }
-        }
-        return false;
+        return exclusionIndex().contains(x, y, z);
     }
 
-    public void onSnapshotSaved(final long snapshotId) {
+    public synchronized void onSnapshotSaved(final long snapshotId) {
         this.latestSnapshotId = snapshotId;
         this.snapshotCount++;
     }
 
-    public void markRegenerated() {
+    /** Make an existing snapshot the restore point (see {@code /ardx load}). */
+    public synchronized void selectSnapshot(final long snapshotId) {
+        this.latestSnapshotId = snapshotId;
+        if (status == ArenaStatus.EMPTY || status == ArenaStatus.ERROR) {
+            status = ArenaStatus.READY;
+        }
+    }
+
+    /**
+     * Atomically move into {@link ArenaStatus#SAVING}.
+     *
+     * @return false if the arena is already saving or regenerating.
+     */
+    public synchronized boolean beginSaving() {
+        if (status == ArenaStatus.SAVING || status == ArenaStatus.REGENERATING) {
+            return false;
+        }
+        status = ArenaStatus.SAVING;
+        return true;
+    }
+
+    /** Leave {@link ArenaStatus#SAVING}: READY on success, otherwise back to READY/EMPTY. */
+    public synchronized void endSaving(final boolean success) {
+        if (status != ArenaStatus.SAVING) {
+            return;
+        }
+        status = success || latestSnapshotId > 0 ? ArenaStatus.READY : ArenaStatus.EMPTY;
+    }
+
+    public synchronized void markRegenerated() {
         this.lastRegeneratedAt = System.currentTimeMillis();
         this.status = ArenaStatus.READY;
     }
 
-    public void setStatus(@NotNull final ArenaStatus status) {
+    public synchronized void setStatus(@NotNull final ArenaStatus status) {
         this.status = status;
+    }
+
+    /** Set {@code next} only if the current status is {@code expected}. */
+    public synchronized boolean compareAndSetStatus(@NotNull final ArenaStatus expected,
+                                                    @NotNull final ArenaStatus next) {
+        if (status != expected) {
+            return false;
+        }
+        status = next;
+        return true;
     }
 
     public void setAutoResetInterval(final int seconds) {

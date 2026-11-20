@@ -6,34 +6,69 @@
 
 package com.dravorax.arenaregendx.arena;
 
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import org.bukkit.Location;
-import org.bukkit.World;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
+import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Records which voxels actually changed since the last snapshot so restore can
- * skip the untouched 90%+ of a warzone.
+ * Records which voxels changed since an arena was last known to match its
+ * snapshot, so restore can skip the untouched 90%+ of a warzone.
  *
- * <p>Empty dirty set means "unknown" (plugin just started, or tracking disabled)
- * and forces a full restore. After a successful save or regen the set is cleared
- * and subsequent match damage is recorded.</p>
+ * <h2>Trust model</h2>
+ * <p>A dirty set is only meaningful if tracking has been running continuously
+ * since the arena last matched its snapshot. An arena becomes <i>trusted</i>
+ * when a snapshot capture or a full restore starts; it loses trust when a
+ * restore fails or is cancelled, when its exclusions change, when another
+ * snapshot is selected, when tracking is toggled off, or when its dirty set
+ * overflows. Untrusted arenas always get a full restore. This fixes the old
+ * behaviour where damage done before a server restart was silently skipped.</p>
+ *
+ * <h2>Memory</h2>
+ * <p>Coordinates are packed into primitive {@code long}s inside a fastutil
+ * {@link LongOpenHashSet} (about 4x smaller than boxed {@code Long}s in a
+ * concurrent set). Each set is capped: once it exceeds the configured
+ * full-restore threshold it is dropped and the arena is flagged for a full
+ * restore, so a never-regenerated arena can no longer grow without bound.</p>
  *
  * @author DravoraX
  */
 public final class ChangeTracker {
 
-    private final ConcurrentHashMap<String, Set<Long>> dirty = new ConcurrentHashMap<>();
+    /** Hard ceiling per arena regardless of arena size (≈ 8 MB of longs). */
+    private static final int ABSOLUTE_CAP = 1_000_000;
+
+    private final ConcurrentHashMap<String, State> states = new ConcurrentHashMap<>();
     private volatile boolean enabled = true;
     private volatile double fullThreshold = 0.35;
+    private volatile ArenaLookup lookup;
+
+    /** Per-arena tracking state. All access to {@link #set} is synchronized on the state. */
+    private static final class State {
+        final LongOpenHashSet set = new LongOpenHashSet();
+        int cap;
+        boolean trusted;
+        boolean overflow;
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration
+    // -----------------------------------------------------------------------
+
+    public void bind(@NotNull final ArenaLookup lookup) {
+        this.lookup = lookup;
+    }
 
     public void setEnabled(final boolean enabled) {
+        final boolean was = this.enabled;
         this.enabled = enabled;
+        if (was != enabled) {
+            // Changes made while tracking was off are unknown: drop every set.
+            states.clear();
+        }
     }
 
     public boolean enabled() {
@@ -44,6 +79,10 @@ public final class ChangeTracker {
         this.fullThreshold = Math.max(0.05, Math.min(1.0, fullThreshold));
     }
 
+    // -----------------------------------------------------------------------
+    // Recording
+    // -----------------------------------------------------------------------
+
     public void mark(@Nullable final Location loc) {
         if (!enabled || loc == null || loc.getWorld() == null) return;
         mark(loc.getWorld().getName(), loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
@@ -51,35 +90,116 @@ public final class ChangeTracker {
 
     public void mark(@NotNull final String world, final int x, final int y, final int z) {
         if (!enabled) return;
-        final Arena arena = findArena(world, x, y, z);
-        if (arena == null || arena.isExcluded(x, y, z)) return;
-        dirty.computeIfAbsent(arena.name(), k -> ConcurrentHashMap.newKeySet()).add(pack(x, y, z));
+        final ArenaLookup l = lookup;
+        final Arena arena = l == null ? null : l.find(world, x, y, z);
+        if (arena == null) return;
+        final State state = states.get(key(arena.name()));
+        if (state == null) return; // untrusted: nothing to record, full restore follows anyway
+        synchronized (state) {
+            if (!state.trusted || state.overflow) return;
+            if (arena.isExcluded(x, y, z)) return;
+            state.set.add(pack(x, y, z));
+            if (state.set.size() > state.cap) {
+                state.overflow = true;
+                state.set.clear();
+                state.set.trim();
+            }
+        }
     }
 
+    // -----------------------------------------------------------------------
+    // Lifecycle hooks
+    // -----------------------------------------------------------------------
+
+    /**
+     * Called when the arena starts matching its snapshot from scratch (snapshot
+     * capture or full restore starting). Clears the set and starts trusting it.
+     */
+    public void reset(@NotNull final Arena arena) {
+        if (!enabled) return;
+        final State state = new State();
+        state.trusted = true;
+        state.cap = capFor(arena);
+        states.put(key(arena.name()), state);
+    }
+
+    /** Drop all knowledge about an arena (deleted, renamed, exclusions or snapshot changed). */
+    public void forget(@NotNull final String arenaName) {
+        states.remove(key(arenaName));
+    }
+
+    /** Back-compat alias for {@link #forget(String)}. */
     public void clear(@NotNull final String arenaName) {
-        dirty.remove(arenaName);
+        forget(arenaName);
     }
 
     /**
-     * @return packed dirty coords, or {@code null} to force a full restore.
+     * Decide what a restore should write and atomically hand the dirty set over to it.
+     *
+     * @param allowDirty whether the caller accepts a partial (dirty-only) restore.
+     * @return the packed voxels to restore, or {@code null} for a full restore.
      */
-    public @Nullable List<Long> snapshotForRestore(@NotNull final Arena arena) {
-        if (!enabled) return null;
-        final Set<Long> set = dirty.get(arena.name());
-        if (set == null || set.isEmpty()) {
-            return null;
+    public long @Nullable [] beginRestore(@NotNull final Arena arena, final boolean allowDirty) {
+        final String key = key(arena.name());
+        final State state = states.get(key);
+        if (allowDirty && enabled && state != null) {
+            synchronized (state) {
+                final int n = state.set.size();
+                if (state.trusted && !state.overflow && n > 0 && n < state.cap) {
+                    final long[] out = state.set.toLongArray();
+                    state.set.clear();
+                    if (n > 4096) {
+                        state.set.trim();
+                    }
+                    return out;
+                }
+            }
         }
-        final int n = set.size();
-        if (n >= Math.max(512, (int) (arena.blockCount() * fullThreshold))) {
-            return null;
-        }
-        return new ArrayList<>(set);
+        // Full restore: the arena will match the snapshot once it finishes.
+        reset(arena);
+        return null;
     }
 
-    public int dirtyCount(@NotNull final String arenaName) {
-        final Set<Long> set = dirty.get(arenaName);
-        return set == null ? 0 : set.size();
+    /** Called when a restore ends. Failed or cancelled restores lose trust. */
+    public void endRestore(@NotNull final String arenaName, final boolean success) {
+        if (!success) {
+            forget(arenaName);
+        }
     }
+
+    // -----------------------------------------------------------------------
+    // Introspection
+    // -----------------------------------------------------------------------
+
+    public int dirtyCount(@NotNull final String arenaName) {
+        final State state = states.get(key(arenaName));
+        if (state == null) return 0;
+        synchronized (state) {
+            return state.set.size();
+        }
+    }
+
+    /** @return true if the next auto restore of this arena can use the dirty set. */
+    public boolean trusted(@NotNull final String arenaName) {
+        final State state = states.get(key(arenaName));
+        if (state == null) return false;
+        synchronized (state) {
+            return state.trusted && !state.overflow;
+        }
+    }
+
+    private int capFor(@NotNull final Arena arena) {
+        final long threshold = (long) (arena.blockCount() * fullThreshold);
+        return (int) Math.min(ABSOLUTE_CAP, Math.max(512L, threshold));
+    }
+
+    private static @NotNull String key(@NotNull final String arenaName) {
+        return arenaName.toLowerCase(Locale.ROOT);
+    }
+
+    // -----------------------------------------------------------------------
+    // Packing (26 bits X, 26 bits Z, 12 bits Y offset by 2048)
+    // -----------------------------------------------------------------------
 
     public static long pack(final int x, final int y, final int z) {
         return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | ((y + 2048) & 0xFFF);
@@ -99,17 +219,6 @@ public final class ChangeTracker {
 
     public static int unpackY(final long p) {
         return ((int) (p & 0xFFF)) - 2048;
-    }
-
-    private volatile ArenaLookup lookup;
-
-    public void bind(@NotNull final ArenaLookup lookup) {
-        this.lookup = lookup;
-    }
-
-    private @Nullable Arena findArena(@NotNull final String world, final int x, final int y, final int z) {
-        final ArenaLookup l = lookup;
-        return l == null ? null : l.find(world, x, y, z);
     }
 
     @FunctionalInterface

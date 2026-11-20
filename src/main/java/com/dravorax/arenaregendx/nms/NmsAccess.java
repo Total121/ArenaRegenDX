@@ -18,101 +18,116 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 
 /**
- * Reflective Paper/NMS bridge. Resolved once, then used as near-direct calls.
+ * Reflective Paper (Mojang-mapped) bridge, resolved once into {@link MethodHandle}s.
  *
- * <p>Writes use {@code Level.setBlock} with client+shape flags (no neighbour
- * physics, no drops). Tile entities round-trip through snapshot NBT when the
- * CraftBukkit methods exist. Everything falls back to Bukkit if a lookup fails
- * so the plugin still runs on Spigot-like forks.</p>
+ * <p>Block writes use {@code Level.setBlock(pos, state, 2 | 16 | 1024)}, the same
+ * flags CraftBukkit uses for {@code setBlockData(data, false)}: notify clients,
+ * no neighbour shape updates, no {@code onPlace}. Before replacing a block that
+ * owns a block entity with a different block, the block entity is removed first
+ * (as CraftBukkit does) so containers never spill their items on restore.</p>
+ *
+ * <p>If any lookup fails the whole fast path is disabled and callers fall back
+ * to the Bukkit API, so the plugin keeps working on unexpected forks.</p>
  *
  * @author DravoraX
  */
 public final class NmsAccess {
 
-    /** UPDATE_CLIENTS | UPDATE_KNOWN_SHAPE | UPDATE_SKIP_ON_PLACE (1.21). */
+    /** UPDATE_CLIENTS | UPDATE_KNOWN_SHAPE | CraftBukkit "no onPlace" (1024). */
     private static final int FLAGS_NO_PHYSICS = 2 | 16 | 1024;
 
     private static final boolean AVAILABLE;
     private static final String STATUS;
 
-    private static final MethodHandle GET_HANDLE;
-    private static final MethodHandle GET_NMS_STATE;
-    private static final Constructor<?> BLOCK_POS_CTOR;
-    private static final MethodHandle SET_BLOCK;
+    private static final MethodHandle GET_HANDLE;        // CraftWorld -> ServerLevel
+    private static final MethodHandle GET_NMS_STATE;     // CraftBlockData -> BlockState
+    private static final MethodHandle NEW_BLOCK_POS;     // (int,int,int) -> BlockPos
+    private static final MethodHandle SET_BLOCK;         // (Level, BlockPos, BlockState, int) -> boolean
+    private static final MethodHandle GET_BLOCK_STATE;   // (Level, BlockPos) -> BlockState
+    private static final MethodHandle REMOVE_BLOCK_ENTITY; // (Level, BlockPos) -> void
+    private static final MethodHandle STATE_IS_AIR;      // BlockState -> boolean
+    private static final MethodHandle STATE_HAS_BE;      // BlockState -> boolean
+    private static final MethodHandle STATE_GET_BLOCK;   // BlockState -> Block
+
     private static final Method GET_SNAPSHOT_NBT;
     private static final Method LOAD_NBT;
     private static final Method NBT_IO_WRITE;
     private static final Method NBT_IO_READ;
-    private static final Class<?> COMPOUND_TAG;
+
+    private static volatile boolean nbtEnabled = true;
 
     static {
-        MethodHandle getHandle = null;
-        MethodHandle getNmsState = null;
-        Constructor<?> blockPosCtor = null;
-        MethodHandle setBlock = null;
-        Method getSnapshotNbt = null;
-        Method loadNbt = null;
-        Method nbtWrite = null;
-        Method nbtRead = null;
-        Class<?> compoundTag = null;
+        MethodHandle getHandle = null, getNmsState = null, newBlockPos = null, setBlock = null;
+        MethodHandle getBlockState = null, removeBe = null, isAir = null, hasBe = null, getBlock = null;
+        Method getSnapshotNbt = null, loadNbt = null, nbtWrite = null, nbtRead = null;
         String status = "bukkit-fallback";
         boolean ok = false;
         try {
+            final MethodHandles.Lookup lookup = MethodHandles.lookup();
             final Class<?> craftWorld = Class.forName("org.bukkit.craftbukkit.CraftWorld");
             final Class<?> craftData = Class.forName("org.bukkit.craftbukkit.block.data.CraftBlockData");
-            getHandle = MethodHandles.lookup().unreflect(craftWorld.getMethod("getHandle"));
-            getNmsState = MethodHandles.lookup().unreflect(craftData.getMethod("getState"));
+            final Method handleMethod = craftWorld.getMethod("getHandle");
+            final Class<?> levelType = handleMethod.getReturnType();
+            final Class<?> blockPos = Class.forName("net.minecraft.core.BlockPos");
+            final Class<?> nmsState = Class.forName("net.minecraft.world.level.block.state.BlockState");
 
-            Class<?> blockPos = load("net.minecraft.core.BlockPos");
-            blockPosCtor = blockPos.getConstructor(int.class, int.class, int.class);
+            getHandle = lookup.unreflect(handleMethod).asType(
+                    java.lang.invoke.MethodType.methodType(Object.class, World.class));
+            getNmsState = lookup.unreflect(craftData.getMethod("getState")).asType(
+                    java.lang.invoke.MethodType.methodType(Object.class, BlockData.class));
+            newBlockPos = lookup.unreflectConstructor(blockPos.getConstructor(int.class, int.class, int.class))
+                    .asType(java.lang.invoke.MethodType.methodType(Object.class, int.class, int.class, int.class));
 
-            final Class<?> nmsState = load("net.minecraft.world.level.block.state.BlockState");
-            final Class<?> handleProbeType = craftWorld.getMethod("getHandle").getReturnType();
-            Method set = findSetBlock(handleProbeType, blockPos, nmsState);
-            if (set == null) {
-                // ServerLevel extends Level — walk supers.
-                Class<?> c = handleProbeType;
-                while (c != null && set == null) {
-                    set = findSetBlock(c, blockPos, nmsState);
-                    c = c.getSuperclass();
-                }
-            }
+            final Method set = findSetBlock(levelType, blockPos, nmsState);
             if (set == null) {
                 throw new IllegalStateException("Level.setBlock not found");
             }
-            setBlock = MethodHandles.lookup().unreflect(set);
+            setBlock = lookup.unreflect(set).asType(java.lang.invoke.MethodType.methodType(
+                    boolean.class, Object.class, Object.class, Object.class, int.class));
+            getBlockState = lookup.unreflect(levelType.getMethod("getBlockState", blockPos)).asType(
+                    java.lang.invoke.MethodType.methodType(Object.class, Object.class, Object.class));
+            removeBe = lookup.unreflect(levelType.getMethod("removeBlockEntity", blockPos)).asType(
+                    java.lang.invoke.MethodType.methodType(void.class, Object.class, Object.class));
+            isAir = lookup.unreflect(nmsState.getMethod("isAir")).asType(
+                    java.lang.invoke.MethodType.methodType(boolean.class, Object.class));
+            hasBe = lookup.unreflect(nmsState.getMethod("hasBlockEntity")).asType(
+                    java.lang.invoke.MethodType.methodType(boolean.class, Object.class));
+            getBlock = lookup.unreflect(nmsState.getMethod("getBlock")).asType(
+                    java.lang.invoke.MethodType.methodType(Object.class, Object.class));
 
             try {
                 final Class<?> craftBes = Class.forName("org.bukkit.craftbukkit.block.CraftBlockEntityState");
                 getSnapshotNbt = findNoArg(craftBes, "getSnapshotNBT", "getSnapshotNbt");
                 loadNbt = findLoad(craftBes);
+                final Class<?> compoundTag = Class.forName("net.minecraft.nbt.CompoundTag");
+                final Class<?> nbtIo = Class.forName("net.minecraft.nbt.NbtIo");
+                nbtWrite = findNbtWrite(nbtIo, compoundTag);
+                nbtRead = findNbtRead(nbtIo, compoundTag);
             } catch (final ClassNotFoundException ignored) {
+                // tile NBT optional
             }
-
-            compoundTag = load("net.minecraft.nbt.CompoundTag");
-            final Class<?> nbtIo = load("net.minecraft.nbt.NbtIo");
-            nbtWrite = findNbtWrite(nbtIo, compoundTag);
-            nbtRead = findNbtRead(nbtIo, compoundTag);
-
             ok = true;
-            status = getSnapshotNbt != null ? "nms+nbt" : "nms-blocks";
+            status = getSnapshotNbt != null && loadNbt != null && nbtWrite != null && nbtRead != null
+                    ? "nms+nbt" : "nms-blocks";
         } catch (final Throwable t) {
             status = "bukkit-fallback (" + t.getClass().getSimpleName() + ")";
         }
         GET_HANDLE = getHandle;
         GET_NMS_STATE = getNmsState;
-        BLOCK_POS_CTOR = blockPosCtor;
+        NEW_BLOCK_POS = newBlockPos;
         SET_BLOCK = setBlock;
+        GET_BLOCK_STATE = getBlockState;
+        REMOVE_BLOCK_ENTITY = removeBe;
+        STATE_IS_AIR = isAir;
+        STATE_HAS_BE = hasBe;
+        STATE_GET_BLOCK = getBlock;
         GET_SNAPSHOT_NBT = getSnapshotNbt;
         LOAD_NBT = loadNbt;
         NBT_IO_WRITE = nbtWrite;
         NBT_IO_READ = nbtRead;
-        COMPOUND_TAG = compoundTag;
         AVAILABLE = ok;
         STATUS = status;
     }
@@ -124,71 +139,82 @@ public final class NmsAccess {
         return AVAILABLE;
     }
 
+    /** Toggle tile NBT capture/restore at runtime ({@code performance.yml → nbt-tiles}). */
+    public static void setNbtEnabled(final boolean enabled) {
+        nbtEnabled = enabled;
+    }
+
     public static boolean nbtAvailable() {
-        return GET_SNAPSHOT_NBT != null && LOAD_NBT != null && NBT_IO_WRITE != null && NBT_IO_READ != null;
+        return nbtEnabled && GET_SNAPSHOT_NBT != null && LOAD_NBT != null && NBT_IO_WRITE != null && NBT_IO_READ != null;
     }
 
     public static @NotNull String status() {
         return STATUS;
     }
 
-    public static @Nullable Object nmsState(@NotNull final BlockData data) {
-        if (GET_NMS_STATE == null) return null;
+    // -----------------------------------------------------------------------
+    // Block access (call only on the thread that owns the chunk)
+    // -----------------------------------------------------------------------
+
+    /** @return the NMS level for {@code world}, or null if unavailable. */
+    public static @Nullable Object level(@NotNull final World world) {
+        if (!AVAILABLE) return null;
         try {
-            return GET_NMS_STATE.invoke(data);
+            return GET_HANDLE.invokeExact(world);
         } catch (final Throwable t) {
             return null;
         }
     }
 
-    public static boolean setBlock(@NotNull final World world, final int x, final int y, final int z,
-                                   @NotNull final Object nmsState) {
-        if (!AVAILABLE) return false;
+    /** @return the canonical NMS block state for Bukkit {@code data}, or null. */
+    public static @Nullable Object nmsState(@NotNull final BlockData data) {
+        if (GET_NMS_STATE == null) return null;
         try {
-            final Object level = GET_HANDLE.invoke(world);
-            final Object pos = BLOCK_POS_CTOR.newInstance(x, y, z);
-            SET_BLOCK.invoke(level, pos, nmsState, FLAGS_NO_PHYSICS);
-            return true;
+            return GET_NMS_STATE.invokeExact(data);
         } catch (final Throwable t) {
-            try {
-                final Object level = GET_HANDLE.invoke(world);
-                final Object pos = BLOCK_POS_CTOR.newInstance(x, y, z);
-                SET_BLOCK.invoke(level, pos, nmsState, 2 | 16);
-                return true;
-            } catch (final Throwable t2) {
-                return false;
-            }
+            return null;
         }
     }
+
+    public static @NotNull Object blockPos(final int x, final int y, final int z) throws Throwable {
+        return NEW_BLOCK_POS.invokeExact(x, y, z);
+    }
+
+    /** @return the current NMS block state at {@code pos}. */
+    public static @NotNull Object stateAt(@NotNull final Object level, @NotNull final Object pos) throws Throwable {
+        return GET_BLOCK_STATE.invokeExact(level, pos);
+    }
+
+    public static boolean isAir(@NotNull final Object nmsState) throws Throwable {
+        return (boolean) STATE_IS_AIR.invokeExact(nmsState);
+    }
+
+    /**
+     * Write {@code target} at {@code pos} without physics. {@code current} is the
+     * state already there (from {@link #stateAt}); used to clear a block entity
+     * that would otherwise drop its contents.
+     */
+    public static boolean write(@NotNull final Object level, @NotNull final Object pos,
+                                @NotNull final Object current, @NotNull final Object target) throws Throwable {
+        if ((boolean) STATE_HAS_BE.invokeExact(current)
+                && STATE_GET_BLOCK.invokeExact(current) != STATE_GET_BLOCK.invokeExact(target)) {
+            REMOVE_BLOCK_ENTITY.invokeExact(level, pos);
+        }
+        return (boolean) SET_BLOCK.invokeExact(level, pos, target, FLAGS_NO_PHYSICS);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tile entity NBT
+    // -----------------------------------------------------------------------
 
     public static byte @Nullable [] captureTileNbt(@NotNull final BlockState state) {
         if (!nbtAvailable()) return null;
         try {
             final Object tag = GET_SNAPSHOT_NBT.invoke(state);
             if (tag == null) return null;
-            return writeTag(tag);
-        } catch (final Throwable t) {
-            return null;
-        }
-    }
-
-    public static boolean restoreTileNbt(@NotNull final BlockState state, final byte @NotNull [] nbt) {
-        if (!nbtAvailable()) return false;
-        try {
-            final Object tag = readTag(nbt);
-            if (tag == null) return false;
-            LOAD_NBT.invoke(state, tag);
-            return true;
-        } catch (final Throwable t) {
-            return false;
-        }
-    }
-
-    private static byte @Nullable [] writeTag(@NotNull final Object tag) {
-        try {
             final ByteArrayOutputStream bout = new ByteArrayOutputStream(256);
             final DataOutputStream out = new DataOutputStream(bout);
-            if (NBT_IO_WRITE.getParameterCount() == 2) {
+            if (NBT_IO_WRITE.getParameterTypes()[0].isInstance(tag)) {
                 NBT_IO_WRITE.invoke(null, tag, out);
             } else {
                 NBT_IO_WRITE.invoke(null, out, tag);
@@ -200,38 +226,49 @@ public final class NmsAccess {
         }
     }
 
-    private static @Nullable Object readTag(final byte @NotNull [] bytes) {
+    public static boolean restoreTileNbt(@NotNull final BlockState state, final byte @NotNull [] nbt) {
+        if (!nbtAvailable()) return false;
         try {
-            final DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes));
-            return NBT_IO_READ.invoke(null, in);
+            java.io.InputStream raw = new ByteArrayInputStream(nbt);
+            if (nbt.length > 2 && (nbt[0] & 0xFF) == 0x1F && (nbt[1] & 0xFF) == 0x8B) {
+                // Older builds could pick NbtIo.writeCompressed (gzip) for capture.
+                raw = new java.util.zip.GZIPInputStream(raw);
+            }
+            final Object tag = NBT_IO_READ.invoke(null, new DataInputStream(raw));
+            if (tag == null) return false;
+            LOAD_NBT.invoke(state, tag);
+            return true;
         } catch (final Throwable t) {
-            return null;
+            return false;
         }
     }
 
-    private static @NotNull Class<?> load(@NotNull final String name) throws ClassNotFoundException {
-        return Class.forName(name);
-    }
+    // -----------------------------------------------------------------------
+    // Lookup helpers
+    // -----------------------------------------------------------------------
 
-    private static @Nullable Method findSetBlock(@NotNull final Class<?> owner,
+    private static @Nullable Method findSetBlock(@NotNull final Class<?> levelType,
                                                  @NotNull final Class<?> blockPos,
                                                  @NotNull final Class<?> nmsState) {
-        for (final Method m : owner.getDeclaredMethods()) {
-            if (!m.getName().equals("setBlock") && !m.getName().equals("setBlockState")) continue;
-            final Class<?>[] p = m.getParameterTypes();
-            if (p.length == 3 && p[0].isAssignableFrom(blockPos) && p[1].isAssignableFrom(nmsState)
-                    && (p[2] == int.class || p[2] == Integer.TYPE)) {
-                m.setAccessible(true);
+        try {
+            final Method m = levelType.getMethod("setBlock", blockPos, nmsState, int.class);
+            if (m.getReturnType() == boolean.class) {
                 return m;
             }
+        } catch (final NoSuchMethodException ignored) {
+            // walk declared methods below
         }
-        try {
-            final Method m = owner.getMethod("setBlock", blockPos, nmsState, int.class);
-            m.setAccessible(true);
-            return m;
-        } catch (final NoSuchMethodException e) {
-            return null;
+        for (Class<?> c = levelType; c != null; c = c.getSuperclass()) {
+            for (final Method m : c.getDeclaredMethods()) {
+                final Class<?>[] p = m.getParameterTypes();
+                if (m.getName().equals("setBlock") && p.length == 3 && p[0].isAssignableFrom(blockPos)
+                        && p[1].isAssignableFrom(nmsState) && p[2] == int.class && m.getReturnType() == boolean.class) {
+                    m.setAccessible(true);
+                    return m;
+                }
+            }
         }
+        return null;
     }
 
     private static @Nullable Method findNoArg(@NotNull final Class<?> owner, @NotNull final String... names) {
@@ -241,6 +278,7 @@ public final class NmsAccess {
                 m.setAccessible(true);
                 return m;
             } catch (final NoSuchMethodException ignored) {
+                // try next
             }
         }
         return null;
@@ -249,8 +287,7 @@ public final class NmsAccess {
     private static @Nullable Method findLoad(@NotNull final Class<?> owner) {
         for (final String name : new String[]{"load", "loadData", "setFromNbt", "applySnapshotNBT"}) {
             for (final Method m : owner.getMethods()) {
-                if (!m.getName().equals(name)) continue;
-                if (m.getParameterCount() == 1) {
+                if (m.getName().equals(name) && m.getParameterCount() == 1) {
                     m.setAccessible(true);
                     return m;
                 }
@@ -261,10 +298,11 @@ public final class NmsAccess {
 
     private static @Nullable Method findNbtWrite(@NotNull final Class<?> nbtIo, @NotNull final Class<?> compound) {
         for (final Method m : nbtIo.getMethods()) {
-            if (!m.getName().equals("write") && !m.getName().equals("writeCompressed")) continue;
+            if (!m.getName().equals("write")) continue;
             final Class<?>[] p = m.getParameterTypes();
-            if (p.length == 2 && (p[0] == compound || p[1] == compound)) {
-                m.setAccessible(true);
+            if (p.length == 2 && (p[0] == compound || p[1] == compound)
+                    && (java.io.DataOutput.class.isAssignableFrom(p[0]) || java.io.DataOutput.class.isAssignableFrom(p[1])
+                    || p[0] == java.io.DataOutput.class || p[1] == java.io.DataOutput.class)) {
                 return m;
             }
         }
@@ -272,20 +310,20 @@ public final class NmsAccess {
     }
 
     private static @Nullable Method findNbtRead(@NotNull final Class<?> nbtIo, @NotNull final Class<?> compound) {
+        try {
+            final Method m = nbtIo.getMethod("read", java.io.DataInput.class);
+            if (m.getReturnType() == compound) {
+                return m;
+            }
+        } catch (final NoSuchMethodException ignored) {
+            // scan below
+        }
         for (final Method m : nbtIo.getMethods()) {
-            if (!m.getName().equals("read") && !m.getName().equals("readCompressed")) continue;
-            if (m.getParameterCount() == 1 && m.getReturnType() == compound) {
-                m.setAccessible(true);
+            if (m.getName().equals("read") && m.getParameterCount() == 1
+                    && m.getParameterTypes()[0] == java.io.DataInput.class && m.getReturnType() == compound) {
                 return m;
             }
         }
-        try {
-            return nbtIo.getMethod("read", java.io.DataInput.class);
-        } catch (final NoSuchMethodException e) {
-            return null;
-        }
+        return null;
     }
-
-    @SuppressWarnings("unused")
-    private static final MethodType MT = MethodType.methodType(Object.class);
 }

@@ -88,7 +88,7 @@ public final class TileEntitySerializer {
         if (nbt != null) {
             return nbt;
         }
-        final Handler handler = HANDLERS.get(state.getClass().getName());
+        final Handler handler = handlerFor(state);
         if (handler == null) {
             return null;
         }
@@ -117,10 +117,11 @@ public final class TileEntitySerializer {
      *
      * @param state   the target BlockState (already placed, must match the captured type).
      * @param payload the payload from {@link #capture}.
+     * @return true if data was applied and the caller should {@code state.update(...)}.
      */
-    public static void restore(@NotNull final BlockState state, final byte @NotNull [] payload) {
-        if (TileNbt.restore(state, payload)) {
-            return;
+    public static boolean restore(@NotNull final BlockState state, final byte @NotNull [] payload) {
+        if (TileNbt.isNbt(payload)) {
+            return TileNbt.restore(state, payload);
         }
         try {
             final DataInputStream in = new DataInputStream(new java.io.ByteArrayInputStream(payload));
@@ -129,15 +130,18 @@ public final class TileEntitySerializer {
             in.readFully(nameBytes);
             final String capturedType = new String(nameBytes, java.nio.charset.StandardCharsets.UTF_8);
             if (!capturedType.equals(state.getClass().getSimpleName())) {
-                // Type mismatch — silently skip to avoid corrupting the block.
-                return;
+                // Type mismatch — skip to avoid corrupting the block.
+                return false;
             }
-            final Handler handler = HANDLERS.get(state.getClass().getName());
-            if (handler != null) {
-                handler.read(in, state);
+            final Handler handler = handlerFor(state);
+            if (handler == null) {
+                return false;
             }
+            handler.read(in, state);
+            return true;
         } catch (final IOException e) {
-            // ByteArrayInputStream does not throw; defensive.
+            // Truncated / legacy payload: leave the block as placed.
+            return false;
         }
     }
 
@@ -150,7 +154,17 @@ public final class TileEntitySerializer {
         void read(@NotNull DataInputStream in, @NotNull BlockState state) throws IOException;
     }
 
-    private static final Map<String, Handler> HANDLERS = new HashMap<>();
+    /** Ordered: more specific types first. Matched with {@code isInstance}, not class names. */
+    private static final Map<Class<?>, Handler> HANDLERS = new java.util.LinkedHashMap<>();
+
+    private static @org.jetbrains.annotations.Nullable Handler handlerFor(@NotNull final BlockState state) {
+        for (final Map.Entry<Class<?>, Handler> e : HANDLERS.entrySet()) {
+            if (e.getKey().isInstance(state)) {
+                return e.getValue();
+            }
+        }
+        return null;
+    }
 
     static {
         // Inventory-backed containers (chests, barrels, shulkers, hoppers, dispensers, droppers).
@@ -162,8 +176,8 @@ public final class TileEntitySerializer {
         // Brewing stand.
         register(BrewingStand.class, new BrewingStandHandler());
         // Signs (incl. hanging signs).
-        register(Sign.class, new SignHandler());
         register(org.bukkit.block.HangingSign.class, new SignHandler());
+        register(Sign.class, new SignHandler());
         // Banners.
         register(Banner.class, new BannerHandler());
         // Beacon.
@@ -186,7 +200,7 @@ public final class TileEntitySerializer {
 
     @SuppressWarnings("unchecked")
     private static void register(@NotNull final Class<? extends BlockState> clazz, @NotNull final Handler h) {
-        HANDLERS.put(clazz.getName(), h);
+        HANDLERS.put(clazz, h);
     }
 
     private static void registerInventoryHandlers() {
@@ -241,16 +255,21 @@ public final class TileEntitySerializer {
         }
 
         @Override public void read(@NotNull final DataInputStream in, @NotNull final BlockState state) throws IOException {
-            if (in.readBoolean() && state instanceof Nameable n) {
+            // Each flag is read exactly once; the payload is consumed even when the
+            // live state lacks the capability (previously a second boolean was read,
+            // desynchronising the stream for non-nameable containers).
+            if (in.readBoolean()) {
                 final String name = readNullableString(in);
-                n.customName(name == null || name.isEmpty() ? null : com.dravorax.arenaregendx.util.ColorUtil.mini(name));
-            } else if (in.readBoolean()) {
-                readNullableString(in); // discard
+                if (state instanceof Nameable n) {
+                    n.customName(name == null || name.isEmpty() ? null
+                            : com.dravorax.arenaregendx.util.ColorUtil.fromLegacy(name));
+                }
             }
-            if (in.readBoolean() && state instanceof Lockable l) {
-                l.setLock(readNullableString(in));
-            } else if (in.readBoolean()) {
-                readNullableString(in); // discard
+            if (in.readBoolean()) {
+                final String lock = readNullableString(in);
+                if (state instanceof Lockable l) {
+                    l.setLock(lock);
+                }
             }
             if (state instanceof InventoryHolder holder) {
                 final int len = SnapshotSerializer.readVarInt(in);
@@ -546,7 +565,7 @@ public final class TileEntitySerializer {
         @Override public void read(@NotNull final DataInputStream in, @NotNull final BlockState state) throws IOException {
             final Nameable n = (Nameable) state;
             final String name = readNullableString(in);
-            n.customName(name == null || name.isEmpty() ? null : com.dravorax.arenaregendx.util.ColorUtil.mini(name));
+            n.customName(name == null || name.isEmpty() ? null : com.dravorax.arenaregendx.util.ColorUtil.fromLegacy(name));
         }
     }
 

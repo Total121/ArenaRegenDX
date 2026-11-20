@@ -11,7 +11,8 @@ import org.bukkit.event.HandlerList;
 import org.jetbrains.annotations.NotNull;
 
 /**
- * Fired when a snapshot has been captured and written to disk.
+ * Fired when a snapshot has been captured and written to disk, on the main
+ * thread (Paper) or the global region thread (Folia).
  *
  * @author DravoraX
  * @since 1.0.0

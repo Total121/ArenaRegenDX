@@ -1,12 +1,12 @@
 /*
- * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * ArenaRegenDX - High-performance arena regeneration
+ * Copyright (C) 2026 DravoraX. All rights reserved.
+ * Licensed exclusively to DravoraX.
  */
 
 package com.dravorax.arenaregendx.arena;
 
-import com.dravorax.arenaregendx.ArenaRegenDXPlugin;
-import com.dravorax.arenaregendx.config.ConfigManager;
+import com.dravorax.arenaregendx.hooks.worldedit.WorldEditHook;
 import com.dravorax.arenaregendx.particles.SelectionVisualizer;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
@@ -22,61 +22,44 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Per-player cuboid selection state (pos1 / pos2) with auto-expiry.
+ * Per-player wand selections (pos1 / pos2).
  *
- * <p>Selections automatically expire after 20 seconds if the player takes too
- * long to create the arena. Particles are shown at both positions immediately
- * and remain until the arena is created or the timeout expires.</p>
+ * <p>Incomplete selections expire after 30 minutes of inactivity; complete
+ * selections are kept until used, cleared, or the player leaves.</p>
  *
  * @author DravoraX
  * @since 1.0.1
  */
 public final class ArenaSelectionManager implements Listener {
 
-    /** Auto-expiry for incomplete selections. Complete boxes stay until used. */
-    private static final long TIMEOUT_MS = 30 * 60 * 1000L;
+    /** Auto-expiry for incomplete selections. */
+    private static final long TIMEOUT_MS = 30L * 60L * 1000L;
 
-    private final ArenaRegenDXPlugin plugin;
-    private final ConfigManager configManager;
     private final SelectionVisualizer visualizer;
-
     private final Map<UUID, Selection> selections = new ConcurrentHashMap<>();
 
-    public ArenaSelectionManager(@NotNull final ArenaRegenDXPlugin plugin,
-                                 @NotNull final ConfigManager configManager,
-                                 @NotNull final SelectionVisualizer visualizer) {
-        this.plugin = plugin;
-        this.configManager = configManager;
+    public ArenaSelectionManager(@NotNull final SelectionVisualizer visualizer) {
         this.visualizer = visualizer;
     }
 
-    /**
-     * Set position 1 for a player.
-     */
     public void setPos1(@NotNull final Player player, @NotNull final Location location) {
         final Selection sel = selections.computeIfAbsent(player.getUniqueId(), k -> new Selection());
-        sel.pos1 = location.clone();
+        sel.pos1 = location.toBlockLocation();
         sel.lastUpdate = System.currentTimeMillis();
         visualizer.showSelection(player, sel);
     }
 
-    /**
-     * Set position 2 for a player.
-     */
     public void setPos2(@NotNull final Player player, @NotNull final Location location) {
         final Selection sel = selections.computeIfAbsent(player.getUniqueId(), k -> new Selection());
-        sel.pos2 = location.clone();
+        sel.pos2 = location.toBlockLocation();
         sel.lastUpdate = System.currentTimeMillis();
         visualizer.showSelection(player, sel);
     }
 
-    /**
-     * @return the player's current selection (may be partial).
-     */
+    /** @return the player's wand selection (may be partial), or null. */
     public @Nullable Selection getSelection(@NotNull final Player player) {
         final Selection sel = selections.get(player.getUniqueId());
         if (sel == null) return null;
-        // Check for auto-expiry.
         if (!sel.isComplete() && System.currentTimeMillis() - sel.lastUpdate > TIMEOUT_MS) {
             clear(player);
             return null;
@@ -85,30 +68,38 @@ public final class ArenaSelectionManager implements Listener {
     }
 
     /**
-     * @return true if the player has both corners set (and not expired).
+     * Resolve the selection a command should use: the wand box and the WorldEdit
+     * selection, in the order given by {@code prefer-worldedit-selection}.
+     *
+     * @return a complete selection, or null.
      */
+    public @Nullable Selection resolve(@NotNull final Player player, final boolean preferWorldEdit) {
+        final Selection wand = getSelection(player);
+        final Selection wandComplete = wand != null && wand.isComplete() ? wand : null;
+        if (preferWorldEdit) {
+            final Selection we = WorldEditHook.getSelection(player);
+            return we != null ? we : wandComplete;
+        }
+        return wandComplete != null ? wandComplete : WorldEditHook.getSelection(player);
+    }
+
     public boolean isComplete(@NotNull final Player player) {
         final Selection sel = getSelection(player);
         return sel != null && sel.isComplete();
     }
 
-    /**
-     * Clear a player's selection.
-     */
     public void clear(@NotNull final Player player) {
         selections.remove(player.getUniqueId());
         visualizer.hideSelection(player);
     }
 
-    /**
-     * Clear all selections.
-     */
     public void clearAll() {
         selections.clear();
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(@NotNull final PlayerQuitEvent event) {
-        clear(event.getPlayer());
+        selections.remove(event.getPlayer().getUniqueId());
+        visualizer.forget(event.getPlayer().getUniqueId());
     }
 }

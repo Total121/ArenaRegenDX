@@ -2,28 +2,29 @@
 # ArenaRegenDX — General configuration
 # Author: DravoraX
 # ============================================================================
+# Apply changes with /ardx reload.
 
-# General plugin settings.
-debug: false          # set to true for verbose logging (use sparingly in production)
-language: en          # reserved for future i18n; messages.yml is the source of truth
-
-# Whether to print the ASCII banner on enable.
+# Print the console banner on startup.
 banner: true
 
-# Whether the selection wand is globally enabled (per-player permission still applies).
+# Allow the selection wand (players still need arenaregendx.wand).
 wand-enabled: true
 
-# Whether to use the player's WorldEdit selection as a fallback when no ArenaRegenDX
-# selection exists (requires WorldEdit).
+# When creating an arena or a cuboid exclusion, use the player's WorldEdit
+# selection before the wand selection (requires WorldEdit). When false, the
+# WorldEdit selection is only used if the wand box is incomplete.
 prefer-worldedit-selection: false
 
-# Auto-regeneration triggers. These keys are live (also toggled in /ardx gui → settings).
-# When an event damages an arena that has a snapshot, that arena is queued.
+# Automatic restores when something damages an arena that has a snapshot.
+# Damage inside exclusion zones never triggers a restore. With dirty tracking
+# (performance.yml) only the changed blocks are rewritten.
+# Also toggleable in /ardx gui -> settings.
 auto-regen:
   on-explosion: true
-  on-fire: false        # optional — can cause extra regens in lava arenas
+  on-fire: false        # can cause frequent restores in lava arenas
   on-piston: false
 
-# Safe-mode default (teleport entities out of voxels before placing solid blocks).
-# Players with arenaregendx.bypass skip safe mode.
+# Safe mode: after blocks are placed, players and mobs that ended up inside a
+# solid block are moved up to the nearest free space. Players with
+# arenaregendx.bypass are not protected when they start a restore themselves.
 safe-mode-default: true

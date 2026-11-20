@@ -8,95 +8,98 @@
 
 plugins {
     id 'java'
-    id 'java-library'
     id 'maven-publish'
 }
 
-group = 'com.dravorax.arenaregendx'
-version = '2.1.0'
-archivesBaseName = 'ArenaRegenDX'
+group = project.property('group')
+version = project.property('version')
 
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(21)
     }
-    compileJava.options.encoding = 'UTF-8'
-    compileJava.options.release = 21
+    withSourcesJar()
+}
+
+base {
+    archivesName = 'ArenaRegenDX'
 }
 
 repositories {
     mavenCentral()
     maven {
-        name = 'papermc-repo'
+        name = 'papermc'
         url = 'https://repo.papermc.io/repository/maven-public/'
     }
     maven {
-        name = 'spigotmc-repo'
-        url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/'
-    }
-    maven {
-        name = 'papi-repo'
+        name = 'placeholderapi'
         url = 'https://repo.extendedclip.com/content/repositories/placeholderapi/'
     }
     maven {
-        name = 'sk89q-repo'
+        name = 'enginehub'
         url = 'https://maven.enginehub.org/repo/'
-    }
-    maven {
-        name = 'sonatype'
-        url = 'https://oss.sonatype.org/content/groups/public/'
     }
 }
 
 dependencies {
+    // Paper API (includes Adventure, fastutil and the Folia scheduler API).
     compileOnly 'io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT'
-    compileOnly 'net.kyori:adventure-api:4.17.0'
-    compileOnly 'net.kyori:adventure-text-minimessage:4.17.0'
-    compileOnly 'net.kyori:adventure-text-serializer-legacy:4.17.0'
     compileOnly('me.clip:placeholderapi:2.11.6') { transitive = false }
+    compileOnly('com.sk89q.worldedit:worldedit-core:7.3.6') { transitive = false }
     compileOnly('com.sk89q.worldedit:worldedit-bukkit:7.3.6') { transitive = false }
     compileOnly('com.sk89q.worldguard:worldguard-bukkit:7.0.12') { transitive = false }
     compileOnly 'org.jetbrains:annotations:24.1.0'
+
+    testImplementation 'io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT'
+    testImplementation platform('org.junit:junit-bom:5.11.3')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+    options.compilerArgs += ['-Xlint:all', '-Xlint:-processing', '-Xlint:-serial', '-parameters']
+    options.deprecation = true
 }
 
 processResources {
+    filteringCharset = 'UTF-8'
+    inputs.property('version', project.version)
     filesMatching('plugin.yml') {
         expand(version: project.version)
     }
 }
 
 jar {
-    archiveFileName = "${archivesBaseName}-${version}.jar"
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    archiveFileName = "ArenaRegenDX-${project.version}.jar"
+    manifest {
+        // NMS reflection uses Mojang names: tell Paper not to remap this plugin.
+        attributes('paperweight-mappings-namespace': 'mojang')
+    }
+}
+
+test {
+    useJUnitPlatform()
 }
 
 javadoc {
     options {
         encoding = 'UTF-8'
         charSet = 'UTF-8'
-        author = true
-        version = true
-        use = true
         windowTitle = 'ArenaRegenDX API'
-        docTitle = "<h1>ArenaRegenDX API v${project.version}</h1>"
+        docTitle = "ArenaRegenDX API v${project.version}"
         bottom = 'Copyright &#169; 2026 DravoraX. All rights reserved.'
         addStringOption('Xdoclint:none', '-quiet')
     }
     failOnError = false
 }
 
-compileJava {
-    options.compilerArgs += ['-Xlint:all', '-Xlint:-processing', '-parameters']
-    options.deprecation = true
-}
-
 publishing {
     publications {
         maven(MavenPublication) {
             from components.java
-            groupId = project.group
-            artifactId = archivesBaseName
-            version = project.version
+            artifactId = 'ArenaRegenDX'
         }
     }
 }

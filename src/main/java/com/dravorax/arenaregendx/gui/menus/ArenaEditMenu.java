@@ -24,13 +24,6 @@ import java.util.List;
  */
 public final class ArenaEditMenu {
 
-    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, String> pendingDelete =
-            new java.util.concurrent.ConcurrentHashMap<>();
-
-    public static void clearPending(@NotNull final java.util.UUID playerId) {
-        pendingDelete.remove(playerId);
-    }
-
     private ArenaEditMenu() { }
 
     private static final int SLOT_INSTANT = 19;
@@ -72,7 +65,7 @@ public final class ArenaEditMenu {
                         ColorUtil.loreLine("size  " + arena.sizeX() + " × " + arena.sizeY() + " × " + arena.sizeZ()),
                         ColorUtil.loreLine("blocks  " + arena.blockCount()),
                         ColorUtil.loreLine("snapshot  #" + arena.latestSnapshotId()),
-                        ColorUtil.loreLine("status  " + arena.status().name().toLowerCase()),
+                        ColorUtil.loreLine("status  " + arena.status().name().toLowerCase(java.util.Locale.ROOT)),
                         ColorUtil.loreLine("auto-reset  " + (arena.autoResetInterval() > 0 ? arena.autoResetInterval() + "s" : "off")),
                         ColorUtil.loreLine("async  " + (arena.asyncRegen() ? "on" : "off")),
                         ColorUtil.loreLine("speed  " + RegenSpeed.label(arena.regenSpeedPercent())
@@ -117,7 +110,7 @@ public final class ArenaEditMenu {
         inv.setItem(SLOT_PREVIEW, GuiItems.named("<aqua>", "preview dust", GuiHeads.PREVIEW,
                 "gold = walls that restore",
                 "red = exclusion volume"));
-        final boolean confirm = arena.name().equals(pendingDelete.get(player.getUniqueId()));
+        final boolean confirm = gm.isDeletePending(player, arena.name());
         inv.setItem(SLOT_DELETE, GuiItems.named("<red>",
                 confirm ? "click again" : "delete arena",
                 GuiHeads.DELETE,
@@ -180,9 +173,7 @@ public final class ArenaEditMenu {
                 final int newTime = Math.max(0, arena.autoResetInterval() - 60);
                 arena.setAutoResetInterval(newTime);
                 gm.arenaManager().saveArena(arena);
-                if (newTime == 0) {
-                    gm.plugin().autoResetManager().stopCountdown(arena.name());
-                }
+                gm.plugin().autoResetManager().startCountdown(arena); // stops it when 0
                 player.sendMessage(ColorUtil.mini("<dark_gray>› <gold>"
                         + ColorUtil.smallCaps("auto-reset ")
                         + "<white>" + (newTime > 0 ? newTime + "s" : ColorUtil.smallCaps("off"))));
@@ -205,44 +196,15 @@ public final class ArenaEditMenu {
                     player.sendMessage(ColorUtil.mini("<red>" + ColorUtil.smallCaps("missing permission")));
                     return;
                 }
-                if (gm.regenManager().isRegenerating(arena.name())
-                        || arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.REGENERATING
-                        || arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.SAVING) {
-                    player.sendMessage(ColorUtil.mini("<red>" + ColorUtil.smallCaps("busy — try again shortly")));
-                    return;
-                }
                 player.closeInventory();
-                final var world = org.bukkit.Bukkit.getWorld(arena.worldName());
-                if (world == null) {
-                    player.sendMessage(ColorUtil.mini("<red>" + ColorUtil.smallCaps("world not loaded")));
-                    return;
-                }
-                final var min = new org.bukkit.Location(world, arena.originX(), arena.originY(), arena.originZ());
-                final var max = new org.bukkit.Location(world,
-                        arena.originX() + arena.sizeX() - 1,
-                        arena.originY() + arena.sizeY() - 1,
-                        arena.originZ() + arena.sizeZ() - 1);
                 player.sendMessage(ColorUtil.mini("<dark_gray>› <gold>"
                         + ColorUtil.smallCaps("saving ") + "<aqua>" + arena.name()));
-                arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.SAVING);
-                gm.plugin().snapshotManager().saveSnapshot(arena.name(), world, min, max).thenAccept(meta -> {
-                    gm.plugin().scheduler().runGlobal(() -> {
-                        if (gm.arenaManager().getArena(arena.name()) == null) return;
-                        arena.onSnapshotSaved(meta.snapshotId());
-                        arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.READY);
-                        gm.arenaManager().saveArena(arena);
-                    });
-                    gm.plugin().scheduler().runAtEntity(player, () -> player.sendMessage(ColorUtil.mini(
-                            "<dark_gray>› <green>" + ColorUtil.smallCaps("saved ") + "<aqua>#" + meta.snapshotId())));
-                }).exceptionally(t -> {
-                    gm.plugin().scheduler().runGlobal(() -> {
-                        if (gm.arenaManager().getArena(arena.name()) != null) {
-                            arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.ERROR);
-                        }
-                    });
-                    gm.plugin().scheduler().runAtEntity(player, () -> player.sendMessage(ColorUtil.mini(
-                            "<red>" + ColorUtil.smallCaps("save failed"))));
-                    return null;
+                gm.arenaManager().captureSnapshot(arena).whenComplete((meta, err) -> {
+                    final net.kyori.adventure.text.Component msg = err == null
+                            ? ColorUtil.mini("<dark_gray>› <green>" + ColorUtil.smallCaps("saved ") + "<aqua>#" + meta.snapshotId())
+                            : ColorUtil.mini("<red>" + ColorUtil.smallCaps("save failed: ") + "<gray>"
+                            + ColorUtil.escape(rootMessage(err)));
+                    gm.plugin().messages().deliver(player, msg);
                 });
             }
             case SLOT_PREVIEW -> {
@@ -256,18 +218,15 @@ public final class ArenaEditMenu {
                     player.sendMessage(ColorUtil.mini("<red>" + ColorUtil.smallCaps("missing permission")));
                     return;
                 }
-                final String waiting = pendingDelete.get(player.getUniqueId());
-                if (arena.name().equals(waiting)) {
-                    pendingDelete.remove(player.getUniqueId());
+                if (gm.confirmDelete(player, arena.name())) {
                     player.closeInventory();
                     if (gm.arenaManager().deleteArena(arena.name())) {
                         player.sendMessage(ColorUtil.mini("<dark_gray>› <red>"
                                 + ColorUtil.smallCaps("deleted ") + "<aqua>" + arena.name()));
                     }
                 } else {
-                    pendingDelete.put(player.getUniqueId(), arena.name());
                     player.sendMessage(ColorUtil.mini("<dark_gray>› <red>"
-                            + ColorUtil.smallCaps("click delete again to confirm")));
+                            + ColorUtil.smallCaps("click delete again within 10s to confirm")));
                     gm.openArenaEdit(player, arenaName);
                 }
             }
@@ -286,18 +245,26 @@ public final class ArenaEditMenu {
             player.sendMessage(ColorUtil.mini("<red>" + ColorUtil.smallCaps("no snapshot. save first.")));
             return;
         }
-        final boolean safe = !player.hasPermission("arenaregendx.bypass");
+        final boolean safe = gm.configManager().general().safeModeDefault && !player.hasPermission("arenaregendx.bypass");
         player.sendMessage(ColorUtil.mini("<dark_gray>› <gold>"
                 + ColorUtil.smallCaps("restoring ") + "<aqua>" + arena.name()
                 + " <gray>(" + ColorUtil.smallCaps(mode.name().replace('_', ' ')) + ")"));
-        gm.regenManager().regen(arena.name(), mode, safe, false).thenAccept(task -> {
-            gm.plugin().scheduler().runAtEntity(player, () -> player.sendMessage(ColorUtil.mini(
+        gm.regenManager().regen(arena.name(), mode, safe, false).thenAccept(task ->
+                gm.plugin().messages().deliver(player, ColorUtil.mini(
                     "<dark_gray>› <green>" + ColorUtil.smallCaps("done. ") + "<white>" + task.blocksApplied()
-                            + " <green>" + ColorUtil.smallCaps("written"))));
-        }).exceptionally(t -> {
-            gm.plugin().scheduler().runAtEntity(player, () -> player.sendMessage(ColorUtil.mini(
-                    "<red>" + ColorUtil.smallCaps("regen failed"))));
+                            + " <green>" + ColorUtil.smallCaps("written")))).exceptionally(t -> {
+            gm.plugin().messages().deliver(player, ColorUtil.mini("<red>" + ColorUtil.smallCaps("regen failed: ")
+                    + "<gray>" + ColorUtil.escape(rootMessage(t))));
             return null;
         });
+    }
+
+    private static @NotNull String rootMessage(@NotNull final Throwable t) {
+        Throwable cur = t;
+        while (cur.getCause() != null && (cur instanceof java.util.concurrent.CompletionException
+                || cur instanceof java.util.concurrent.ExecutionException)) {
+            cur = cur.getCause();
+        }
+        return cur.getMessage() == null ? cur.getClass().getSimpleName() : cur.getMessage();
     }
 }

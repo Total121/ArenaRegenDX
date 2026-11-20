@@ -1,6 +1,6 @@
 /*
  * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * Copyright (C) 2026 DravoraX. All rights reserved.
  */
 
 package com.dravorax.arenaregendx.util;
@@ -11,6 +11,9 @@ import net.kyori.adventure.text.minimessage.tag.resolver.TagResolver;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+
+import java.util.Locale;
+import java.util.regex.Pattern;
 
 /**
  * Centralised text utilities built on the Adventure API.
@@ -39,6 +42,12 @@ public final class ColorUtil {
             .build();
 
     private static final char[] SMALL_CAPS = new char[128];
+
+    /** Longest accepted arena / exclusion name (also a directory name on disk). */
+    public static final int MAX_NAME_LENGTH = 48;
+
+    private static final Pattern LEGACY_CODES = Pattern.compile("[&§][0-9a-fk-orxA-FK-ORX]");
+    private static final Pattern TAGS = Pattern.compile("<[^>]*>");
 
     static {
         final String from = "abcdefghijklmnopqrstuvwxyz";
@@ -90,6 +99,11 @@ public final class ColorUtil {
         return LEGACY.serialize(component);
     }
 
+    /** Inverse of {@link #legacy(Component)} (ampersand codes with {@code &#rrggbb} hex). */
+    public static @NotNull Component fromLegacy(@NotNull final String legacy) {
+        return LEGACY.deserialize(legacy);
+    }
+
     /**
      * Strip all MiniMessage / legacy formatting from a string, returning plain text.
      * Useful for log-safe output and filename validation.
@@ -101,10 +115,19 @@ public final class ColorUtil {
         if (input == null) {
             return "";
         }
-        // Strip legacy ampersand codes & MiniMessage tags.
-        String s = input.replaceAll("&[0-9a-fk-orA-FK-OR]", "");
-        s = s.replaceAll("<[^>]*>", "");
-        return s;
+        // Strip legacy ampersand / section codes & MiniMessage tags.
+        return TAGS.matcher(LEGACY_CODES.matcher(input).replaceAll("")).replaceAll("");
+    }
+
+    /**
+     * Escape user-supplied text so it is shown literally inside a MiniMessage
+     * template (prevents players injecting click / hover / color tags).
+     */
+    public static @NotNull String escape(@Nullable final String input) {
+        if (input == null || input.isEmpty()) {
+            return "";
+        }
+        return MINI.escapeTags(input);
     }
 
     /**
@@ -150,13 +173,14 @@ public final class ColorUtil {
      * Sanitize a name for use as a filesystem-safe identifier.
      *
      * @param raw the raw name.
-     * @return a sanitized name (lowercase alnum + dash + underscore).
+     * @return a sanitized name (lowercase alnum + dash + underscore); may be empty.
      */
     public static @NotNull String sanitizeName(@Nullable final String raw) {
         if (raw == null) {
-            return "unnamed";
+            return "";
         }
-        final String plain = plain(raw).trim().toLowerCase();
+        // Locale.ROOT: under a Turkish default locale "I" would lower-case to a dotless i and be dropped.
+        final String plain = plain(raw).trim().toLowerCase(Locale.ROOT);
         final StringBuilder sb = new StringBuilder(plain.length());
         for (int i = 0; i < plain.length(); i++) {
             final char c = plain.charAt(i);
@@ -164,7 +188,11 @@ public final class ColorUtil {
                 sb.append(c);
             }
         }
-        final String out = sb.toString();
-        return out.isEmpty() ? "unnamed" : out;
+        return sb.toString();
+    }
+
+    /** @return true if {@code sanitized} is a usable arena / zone identifier. */
+    public static boolean isValidName(@Nullable final String sanitized) {
+        return sanitized != null && !sanitized.isEmpty() && sanitized.length() <= MAX_NAME_LENGTH;
     }
 }

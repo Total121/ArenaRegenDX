@@ -12,8 +12,8 @@ author: DravoraX
 website: https://dravorax.net
 description: >
   High-performance arena snapshot and restore engine. Paletted delta restore,
-  exclusion zones (protect spawn inside a warzone), dust selection overlays.
-  Folia-safe. Zero telemetry.
+  dirty-voxel tracking, exclusion zones (protect a spawn inside a warzone),
+  dust selection overlays. Folia-safe. Zero telemetry.
 
 folia-supported: true
 
@@ -28,7 +28,6 @@ commands:
     usage: /ardx help
     aliases: [arenaregendx, arenaregen, sregen, sar]
     permission: arenaregendx.use
-    permission-message: "&cYou do not have permission to use ArenaRegenDX."
 
 permissions:
   arenaregendx.*:
@@ -46,13 +45,12 @@ permissions:
       arenaregendx.wand: true
       arenaregendx.reload: true
       arenaregendx.debug: true
-      arenaregendx.bypass: true
     default: op
   arenaregendx.use:
-    description: Base access to /ardx (subcommand perms still apply)
+    description: Base access to /ardx, list and info (subcommand permissions still apply)
     default: op
   arenaregendx.admin:
-    description: Access to admin tools and status
+    description: Admin tools (status, rename, speed, autoreset, setspawn); implies every subcommand
     default: op
   arenaregendx.create:
     description: Create arenas and exclusion zones
@@ -64,7 +62,7 @@ permissions:
     description: Save arena snapshots
     default: op
   arenaregendx.load:
-    description: Load arena snapshots
+    description: List snapshots and pick the restore point (/ardx snapshots, /ardx load)
     default: op
   arenaregendx.regen:
     description: Restore arenas
@@ -85,5 +83,5 @@ permissions:
     description: View debug information
     default: op
   arenaregendx.bypass:
-    description: Bypass safe-mode entity lift
-    default: op
+    description: Restores you start do not lift entities out of blocks (safe mode off)
+    default: false

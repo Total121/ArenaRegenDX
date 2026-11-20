@@ -162,7 +162,7 @@ public final class ExclusionZone {
     public static @Nullable ExclusionZone readFrom(@NotNull final String name,
                                                    @NotNull final ConfigurationSection section) {
         try {
-            final Shape shape = Shape.valueOf(section.getString("shape", "CUBOID").toUpperCase());
+            final Shape shape = Shape.valueOf(section.getString("shape", "CUBOID").trim().toUpperCase(java.util.Locale.ROOT));
             return new ExclusionZone(
                     name, shape,
                     section.getInt("min.x"), section.getInt("min.y"), section.getInt("min.z"),

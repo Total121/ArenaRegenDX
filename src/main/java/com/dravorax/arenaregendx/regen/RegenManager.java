@@ -1,54 +1,67 @@
 /*
- * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * ArenaRegenDX - High-performance arena regeneration
+ * Copyright (C) 2026 DravoraX. All rights reserved.
+ * Licensed exclusively to DravoraX.
  */
 
 package com.dravorax.arenaregendx.regen;
 
 import com.dravorax.arenaregendx.ArenaRegenDXPlugin;
+import com.dravorax.arenaregendx.api.events.ArenaRegenCompleteEvent;
 import com.dravorax.arenaregendx.arena.Arena;
 import com.dravorax.arenaregendx.arena.ArenaManager;
+import com.dravorax.arenaregendx.arena.ArenaStatus;
 import com.dravorax.arenaregendx.config.ConfigManager;
-import com.dravorax.arenaregendx.regen.RegenSpeed;
+import com.dravorax.arenaregendx.config.Settings;
 import com.dravorax.arenaregendx.scheduler.SchedulerAdapter;
+import com.dravorax.arenaregendx.scheduler.SchedulerProvider;
+import com.dravorax.arenaregendx.scheduler.TaskHandle;
 import com.dravorax.arenaregendx.snapshot.Snapshot;
 import com.dravorax.arenaregendx.snapshot.SnapshotManager;
 import com.dravorax.arenaregendx.tps.TPSMonitor;
+import com.dravorax.arenaregendx.util.RegistryUtil;
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.Sound;
+import org.bukkit.World;
+import org.bukkit.event.player.PlayerTeleportEvent;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Manages the regeneration queue with adaptive TPS-based throttling.
+ * Serial regeneration queue with adaptive, TPS-aware throttling.
  *
  * <h2>Queue model</h2>
- * <p>A single global repeating task (period = 1 tick) drives the queue. Each tick:</p>
- * <ol>
- *   <li>Read the adaptive block budget from {@link TPSMonitor#adaptiveBlockBudget()}.</li>
- *   <li>If a batch from the head task is in-flight, skip (wait for completion).</li>
- *   <li>Otherwise, dispatch a new batch of up to {@code budget} blocks from the head task.</li>
- *   <li>When the head task completes, pop it and start the next.</li>
- * </ol>
+ * <p>One global repeating task (period = 1 tick) drives the queue. Each tick it
+ * reads the adaptive block / time budget from {@link TPSMonitor}, and if no
+ * batch is in flight dispatches the next batch of the head job. When the head
+ * job finishes the next one starts. At most one batch is in flight at a time,
+ * so restore work can never pile up on the server thread.</p>
  *
- * <p>This guarantees the server thread is never overwhelmed: at most one batch
- * (≤ budget blocks) is in flight at any time, and the budget scales down
- * automatically as TPS drops.</p>
- *
- * <h2>Concurrency</h2>
- * <p>Only one task runs at a time (serial queue). Concurrent regeneration of
- * multiple arenas would compete for the same budget; serializing keeps TPS
- * stable. If parallelism is needed, multiple queues can be added later.</p>
+ * <h2>Robustness</h2>
+ * <p>Every batch carries a generation number. A watchdog fails a job whose
+ * batch has been in flight for longer than {@value #STALL_TIMEOUT_SECONDS}
+ * seconds (for example a region task lost during a Folia region shutdown), so
+ * the queue never stalls forever; a late callback from the abandoned batch
+ * cannot release a newer batch's slot.</p>
  *
  * @author DravoraX
  * @since 1.0.0
  */
 public final class RegenManager {
+
+    private static final long STALL_TIMEOUT_SECONDS = 60L;
+    /** Never spend more than half a tick restoring, whatever the speed multiplier. */
+    private static final long MAX_NANOS_PER_TICK = 25_000_000L;
 
     private final ArenaRegenDXPlugin plugin;
     private final SnapshotManager snapshotManager;
@@ -57,26 +70,16 @@ public final class RegenManager {
     private final ConfigManager configManager;
     private final SchedulerAdapter scheduler;
 
-    /** The queue of pending tasks (FIFO). */
     private final ConcurrentLinkedQueue<ActiveJob> queue = new ConcurrentLinkedQueue<>();
-
-    /** Currently-executing job (null if idle). */
-    private volatile ActiveJob current;
-
-    /** True if a batch from {@link #current} is in-flight (awaiting completion). */
-    private volatile boolean batchInFlight = false;
-
-    /** All known active jobs (queue + current), keyed by job id, for status queries. */
     private final ConcurrentMap<UUID, ActiveJob> allJobs = new ConcurrentHashMap<>();
-
-    /** The repeating driver task. */
-    private com.dravorax.arenaregendx.scheduler.TaskHandle driver;
-
-    /**
-     * Arenas that have a restore in-flight or about to be queued.
-     * Value is a generation token invalidated by {@link #cancel(String)}.
-     */
+    /** Arenas with a restore in flight or being prepared; value = generation token. */
     private final ConcurrentMap<String, UUID> starting = new ConcurrentHashMap<>();
+
+    private volatile ActiveJob current;
+    private volatile boolean batchInFlight;
+    private volatile long batchGeneration;
+    private volatile long batchStartedNanos;
+    private TaskHandle driver;
 
     public RegenManager(@NotNull final ArenaRegenDXPlugin plugin,
                         @NotNull final SnapshotManager snapshotManager,
@@ -92,71 +95,74 @@ public final class RegenManager {
         this.scheduler = scheduler;
     }
 
-    /**
-     * Start the queue driver. Called once during plugin enable.
-     */
+    /** Start the queue driver. Called once during plugin enable. */
     public void start() {
         if (driver != null) {
             return;
         }
-        // Apply TPS thresholds from config.
-        final var p = configManager.performance();
+        final Settings.PerformanceSettings p = configManager.performance();
         tpsMonitor.configure(p.maxBlockBudget, p.tpsFull, p.tpsThrottle, p.tpsCrawl, p.maxTickMillis);
         driver = scheduler.runGlobalRepeating(this::tick, 1L, 1L);
-        plugin.getSLF4JLogger().info("Restore driver started ({} blocks/tick, {}ms budget @ 20 TPS).",
+        plugin.getSLF4JLogger().info("Restore driver started ({} blocks/tick, {}ms budget at 20 TPS).",
                 p.maxBlockBudget, p.maxTickMillis);
     }
 
-    /**
-     * Per-tick driver: dispatch the next batch if idle.
-     */
+    /** Per-tick driver: dispatch the next batch when idle. */
     private void tick() {
         if (batchInFlight) {
-            return; // wait for the in-flight batch
+            final ActiveJob stalled = current;
+            if (stalled != null && System.nanoTime() - batchStartedNanos > TimeUnit.SECONDS.toNanos(STALL_TIMEOUT_SECONDS)) {
+                plugin.getSLF4JLogger().error("Restore of '{}' made no progress for {}s - aborting it.",
+                        stalled.arenaName, STALL_TIMEOUT_SECONDS);
+                batchGeneration++;          // ignore the abandoned batch's callback
+                batchInFlight = false;
+                stalled.task.markFailed();
+                current = null;
+            }
+            return;
         }
-        // Pop the next job if the current is done.
-        if (current != null && current.task.isDone()) {
+        ActiveJob job = current;
+        if (job != null && job.task.isDone()) {
+            job = null;
             current = null;
         }
-        if (current == null) {
-            current = queue.poll();
-            if (current == null) {
-                return; // queue empty
+        if (job == null) {
+            job = queue.poll();
+            if (job == null) {
+                return;
             }
+            current = job;
         }
-        // Dispatch the next batch.
+        final double speed = Math.max(RegenSpeed.MIN, Math.min(RegenSpeed.MAX, job.speedPercent)) / 100.0;
+        final int blockBudget = (int) Math.max(1L, Math.round(Math.max(1, tpsMonitor.adaptiveBlockBudget()) * speed));
+        final long nanoBudget = Math.min(MAX_NANOS_PER_TICK,
+                Math.max(50_000L, (long) (tpsMonitor.adaptiveNanosBudget() * speed)));
+
+        final long generation = ++batchGeneration;
         batchInFlight = true;
-        final int speedPercent = Math.max(10, Math.min(500, current.speedPercent));
-        final double speedMul = speedPercent / 100.0;
-        // Floor before multiply so slow presets actually reduce throughput.
-        final int budget = Math.max(1, (int) Math.round(
-                Math.max(1, tpsMonitor.adaptiveBlockBudget()) * speedMul));
-        final long nanoBudget = Math.max(50_000L, (long) (
-                Math.max(50_000L, tpsMonitor.adaptiveNanosBudget()) * speedMul));
-        final ActiveJob job = current;
+        batchStartedNanos = System.nanoTime();
+        final ActiveJob dispatched = job;
         try {
-            job.task.applyBatch(budget, nanoBudget, () -> batchInFlight = false);
+            dispatched.task.applyBatch(blockBudget, nanoBudget, () -> {
+                if (batchGeneration == generation) {
+                    batchInFlight = false;
+                }
+            });
         } catch (final Throwable t) {
-            plugin.getSLF4JLogger().error("Regen batch dispatch failed for job {}", job.id, t);
-            batchInFlight = false;
-            job.task.markFailed();
-            if (!job.future.isDone()) {
-                job.future.completeExceptionally(t);
+            plugin.getSLF4JLogger().error("Regen batch dispatch failed for '{}'", dispatched.arenaName, t);
+            if (batchGeneration == generation) {
+                batchInFlight = false;
             }
-            allJobs.remove(job.id);
-            starting.remove(job.arenaName.toLowerCase(java.util.Locale.ROOT), job.token);
+            dispatched.task.markFailed();
             current = null;
         }
     }
 
-    /**
-     * Submit a regeneration job for an arena using its latest snapshot.
-     *
-     * @param arenaName the arena name.
-     * @param mode      the regeneration mode.
-     * @param safeMode  if true, teleport entities out of voxels before placing solid blocks.
-     * @return a future completed when regeneration finishes.
-     */
+    // -----------------------------------------------------------------------
+    // Submission
+    // -----------------------------------------------------------------------
+
+    /** Regenerate an arena from its active snapshot (full restore). */
     public @NotNull CompletableFuture<RegenTask> regen(@NotNull final String arenaName,
                                                        @NotNull final RegenMode mode,
                                                        final boolean safeMode) {
@@ -164,9 +170,9 @@ public final class RegenManager {
     }
 
     /**
-     * @param allowDirty if true, restore only tracked dirty voxels when that set
-     *                   is warm. Manual / GUI regen must pass {@code false} so the
-     *                   full snapshot is always written.
+     * @param allowDirty if true, restore only tracked dirty voxels when the
+     *                   tracker trusts its record for this arena. Manual / GUI
+     *                   restores pass {@code false} so the full snapshot is applied.
      */
     public @NotNull CompletableFuture<RegenTask> regen(@NotNull final String arenaName,
                                                        @NotNull final RegenMode mode,
@@ -178,320 +184,191 @@ public final class RegenManager {
             future.completeExceptionally(new IllegalArgumentException("Arena not found: " + arenaName));
             return future;
         }
-        final String key = arena.name().toLowerCase(java.util.Locale.ROOT);
+        final String key = key(arena.name());
         final UUID token = UUID.randomUUID();
         if (isRegenerating(arena.name()) || starting.putIfAbsent(key, token) != null) {
-            future.completeExceptionally(new IllegalStateException("Arena already regenerating: " + arenaName));
+            future.completeExceptionally(new IllegalStateException("Arena " + arena.name() + " is already regenerating."));
             return future;
         }
-        if (arena.latestSnapshotId() <= 0) {
+        final String rejection = arena.latestSnapshotId() <= 0
+                ? "Arena " + arena.name() + " has no snapshot. Run /ardx save " + arena.name() + " first."
+                : arena.status() == ArenaStatus.SAVING
+                ? "Arena " + arena.name() + " is saving a snapshot; try again shortly."
+                : Bukkit.getWorld(arena.worldName()) == null
+                ? "World not loaded: " + arena.worldName()
+                : null;
+        if (rejection != null) {
             starting.remove(key, token);
-            future.completeExceptionally(new IllegalStateException(
-                    "Arena has no snapshot: " + arenaName + ". Delete and recreate it to auto-save."));
+            future.completeExceptionally(new IllegalStateException(rejection));
             return future;
         }
-        if (arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.SAVING) {
-            starting.remove(key, token);
-            future.completeExceptionally(new IllegalStateException(
-                    "Arena is currently saving a snapshot: " + arenaName));
-            return future;
-        }
-        final org.bukkit.World world = org.bukkit.Bukkit.getWorld(arena.worldName());
-        if (world == null) {
-            starting.remove(key, token);
-            future.completeExceptionally(new IllegalStateException("World not loaded: " + arena.worldName()));
-            return future;
-        }
-        snapshotManager.loadSnapshot(arenaName, arena.latestSnapshotId()).whenComplete((snapshot, err) -> {
+        final World world = Bukkit.getWorld(arena.worldName());
+        snapshotManager.loadSnapshot(arena.name(), arena.latestSnapshotId()).whenComplete((snapshot, err) -> {
             if (!token.equals(starting.get(key))) {
-                if (!future.isDone()) {
-                    future.completeExceptionally(new RuntimeException("Regen cancelled"));
-                }
+                future.completeExceptionally(new IllegalStateException("Regen cancelled"));
                 return;
             }
             if (err != null || snapshot == null) {
                 starting.remove(key, token);
-                future.completeExceptionally(err != null ? err : new IllegalStateException("Snapshot load returned null"));
+                future.completeExceptionally(err != null ? unwrap(err) : new IllegalStateException("Snapshot load returned null"));
                 return;
             }
-            if (arenaManager.getArena(arena.name()) == null) {
+            if (snapshot.sizeX() != arena.sizeX() || snapshot.sizeY() != arena.sizeY() || snapshot.sizeZ() != arena.sizeZ()) {
                 starting.remove(key, token);
-                future.completeExceptionally(new IllegalStateException("Arena deleted during snapshot load: " + arenaName));
+                future.completeExceptionally(new IllegalStateException("Snapshot #" + arena.latestSnapshotId()
+                        + " does not match the arena size; recapture it with /ardx save " + arena.name()));
                 return;
             }
-            // Hop onto the arena's region before any Bukkit player/world API.
-            final org.bukkit.Location origin = new org.bukkit.Location(
-                    world, arena.originX(), arena.originY(), arena.originZ());
+            final Location origin = new Location(world, arena.originX(), arena.originY(), arena.originZ());
             scheduler.runAtLocation(origin, () -> {
-                if (!token.equals(starting.get(key)) || arenaManager.getArena(arena.name()) == null) {
+                if (!token.equals(starting.get(key)) || arenaManager.getArena(arena.name()) != arena) {
                     starting.remove(key, token);
-                    if (!future.isDone()) {
-                        future.completeExceptionally(new RuntimeException("Regen cancelled"));
-                    }
+                    future.completeExceptionally(new IllegalStateException("Regen cancelled"));
                     return;
                 }
-                enqueueLoaded(arena, world, snapshot, mode, safeMode, allowDirty, key, token, future);
+                enqueue(arena, world, snapshot, mode, safeMode, allowDirty, key, token, future);
             }, () -> {
                 starting.remove(key, token);
-                if (!future.isDone()) {
-                    future.completeExceptionally(new IllegalStateException(
-                            "Could not schedule regen on arena region (Folia schedule failed)"));
-                }
+                future.completeExceptionally(new IllegalStateException("Could not schedule the restore (server shutting down?)"));
             });
         });
         return future;
     }
 
-    private void enqueueLoaded(@NotNull final Arena arena,
-                               @NotNull final org.bukkit.World world,
-                               @NotNull final Snapshot snapshot,
-                               @NotNull final RegenMode mode,
-                               final boolean safeMode,
-                               final boolean allowDirty,
-                               @NotNull final String key,
-                               @NotNull final UUID token,
-                               @NotNull final CompletableFuture<RegenTask> future) {
+    private void enqueue(@NotNull final Arena arena, @NotNull final World world, @NotNull final Snapshot snapshot,
+                         @NotNull final RegenMode mode, final boolean safeMode, final boolean allowDirty,
+                         @NotNull final String key, @NotNull final UUID token,
+                         @NotNull final CompletableFuture<RegenTask> future) {
         try {
-            teleportPlayersToSpawn(arena);
-            final long regenStart = System.currentTimeMillis();
-            snapshot.resolvePalette();
-            final var perf = configManager.performance();
-            plugin.changeTracker().setEnabled(perf.dirtyTracking);
-            plugin.changeTracker().setFullThreshold(perf.dirtyFullThreshold);
-            final java.util.List<Long> dirty = (allowDirty && perf.dirtyTracking)
-                    ? plugin.changeTracker().snapshotForRestore(arena)
-                    : null;
-            final int parallel = com.dravorax.arenaregendx.scheduler.SchedulerProvider.isFolia()
-                    ? perf.parallelChunks : 1;
+            final Settings.PerformanceSettings perf = configManager.performance();
+            teleportPlayersToSpawn(arena, world);
+            final long[] dirty = plugin.changeTracker().beginRestore(arena, allowDirty && perf.dirtyTracking);
+            final boolean folia = SchedulerProvider.isFolia();
             final RegenProgressBar bar = perf.progressBar ? new RegenProgressBar(arena.name(), scheduler) : null;
             if (bar != null) {
-                arenaManager.forEachPlayerInArena(arena, p -> bar.show(java.util.List.of(p)));
+                arenaManager.forEachPlayerInArena(arena, p -> bar.show(List.of(p)));
             }
-            arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.REGENERATING);
+            arena.setStatus(ArenaStatus.REGENERATING);
             playArenaSound(arena, configManager.sounds().regenStart);
-            final int speedPercent = RegenSpeed.resolve(
-                    arena.regenSpeedPercent(), perf.regenSpeedPercent);
+            final int speedPercent = RegenSpeed.resolve(arena.regenSpeedPercent(), perf.regenSpeedPercent);
+            final long startedAt = System.currentTimeMillis();
+            final ActiveJob[] holder = new ActiveJob[1];
             final RegenTask task = new RegenTask(plugin, scheduler, snapshot, world,
                     arena.originX(), arena.originY(), arena.originZ(),
                     mode, safeMode, arena.exclusionIndex(),
-                    perf.deltaSkip, dirty, parallel,
-                    t -> completeJob(arena, key, token, bar, regenStart, t),
+                    perf.deltaSkip, perf.skipUnchangedTiles, dirty,
+                    folia ? perf.parallelChunks : 1, !folia,
+                    t -> completeJob(holder[0], arena, startedAt, t),
                     progress -> {
                         if (bar != null) bar.progress(progress);
                     });
-            // Insert first, then re-validate. cancel() clears `starting` before
-            // the job exists; without a post-insert check the job can survive.
             final ActiveJob job = new ActiveJob(UUID.randomUUID(), arena.name(), task, future, bar, token, speedPercent);
+            holder[0] = job;
             allJobs.put(job.id, job);
             queue.add(job);
-            if (!token.equals(starting.get(key)) || arenaManager.getArena(arena.name()) == null) {
+            // cancel() may have run between the token check and here.
+            if (!token.equals(starting.get(key)) || arenaManager.getArena(arena.name()) != arena) {
                 queue.remove(job);
-                allJobs.remove(job.id);
-                job.task.cancel();
-                if (bar != null) {
-                    bar.hideRemaining();
-                }
-                starting.remove(key, token);
-                if (arenaManager.getArena(arena.name()) != null) {
-                    arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.READY);
-                }
-                if (!future.isDone()) {
-                    future.completeExceptionally(new RuntimeException("Regen cancelled"));
-                }
+                task.cancel();
                 return;
             }
-            plugin.getSLF4JLogger().info("Queued regen '{}' mode={} speed={}%", arena.name(), mode, speedPercent);
+            plugin.getSLF4JLogger().info("Queued restore of '{}' (mode={}, speed={}%, {}).", arena.name(), mode,
+                    speedPercent, dirty == null ? "full" : dirty.length + " dirty voxels");
         } catch (final Throwable t) {
             starting.remove(key, token);
-            arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.ERROR);
+            plugin.changeTracker().endRestore(arena.name(), false);
+            arena.compareAndSetStatus(ArenaStatus.REGENERATING, ArenaStatus.ERROR);
             future.completeExceptionally(t);
         }
     }
 
-    private void completeJob(@NotNull final Arena arena,
-                             @NotNull final String key,
-                             @NotNull final UUID token,
-                             @Nullable final RegenProgressBar bar,
-                             final long regenStart,
-                             @NotNull final RegenTask t) {
-        if (bar != null) {
-            bar.hideRemaining();
-        }
-        starting.remove(key, token);
-        final ActiveJob j = findByTask(t);
-        if (t.isCancelled()) {
-            if (arenaManager.getArena(arena.name()) != null
-                    && arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.REGENERATING) {
-                arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.READY);
-            }
-            if (j != null) {
-                if (!j.future.isDone()) {
-                    j.future.completeExceptionally(new RuntimeException("Regen cancelled"));
-                }
-                allJobs.remove(j.id);
-            }
+    private void completeJob(@Nullable final ActiveJob job, @NotNull final Arena arena,
+                             final long startedAt, @NotNull final RegenTask task) {
+        if (job == null) {
             return;
         }
-        if (t.isFailed()) {
-            if (arenaManager.getArena(arena.name()) != null) {
-                arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.ERROR);
+        if (job.bar != null) {
+            job.bar.hideRemaining();
+        }
+        starting.remove(key(arena.name()), job.token);
+        allJobs.remove(job.id);
+        queue.remove(job);
+        final boolean stillExists = arenaManager.getArena(arena.name()) == arena;
+        final boolean success = !task.isCancelled() && !task.isFailed();
+        plugin.changeTracker().endRestore(arena.name(), success);
+
+        if (task.isCancelled()) {
+            if (stillExists) {
+                arena.compareAndSetStatus(ArenaStatus.REGENERATING, ArenaStatus.READY);
+            }
+            job.future.completeExceptionally(new IllegalStateException("Regen cancelled"));
+            return;
+        }
+        if (task.isFailed()) {
+            if (stillExists) {
+                arena.compareAndSetStatus(ArenaStatus.REGENERATING, ArenaStatus.ERROR);
                 arenaManager.saveArena(arena);
             }
-            if (j != null) {
-                if (!j.future.isDone()) {
-                    j.future.completeExceptionally(new RuntimeException("Regen failed"));
-                }
-                allJobs.remove(j.id);
-            }
+            playArenaSound(arena, configManager.sounds().error);
+            job.future.completeExceptionally(new IllegalStateException("Regen failed (see console)"));
             return;
         }
-        // Success — only mutate/persist if the arena still exists under this name.
-        if (arenaManager.getArena(arena.name()) == null) {
-            if (j != null) {
-                if (!j.future.isDone()) {
-                    j.future.complete(t);
-                }
-                allJobs.remove(j.id);
-            }
-            return;
+        if (stillExists) {
+            arena.markRegenerated();
+            arenaManager.saveArena(arena);
+            playArenaSound(arena, configManager.sounds().regenComplete);
+            final long duration = System.currentTimeMillis() - startedAt;
+            final int applied = task.blocksApplied();
+            scheduler.runGlobal(() -> Bukkit.getPluginManager().callEvent(
+                    new ArenaRegenCompleteEvent(arena, applied, duration)));
+            plugin.getSLF4JLogger().info("Restored '{}' in {} ms ({} written, {} unchanged, {} excluded).",
+                    arena.name(), duration, applied, task.blocksSkipped(), task.blocksExcluded());
         }
-        plugin.changeTracker().clear(arena.name());
-        arena.markRegenerated();
-        arenaManager.saveArena(arena);
-        playArenaSound(arena, configManager.sounds().regenComplete);
-        final long duration = System.currentTimeMillis() - regenStart;
-        final int applied = t.blocksApplied();
-        scheduler.runGlobal(() -> {
-            try {
-                final var event = new com.dravorax.arenaregendx.api.events.ArenaRegenCompleteEvent(
-                        arena, applied, duration);
-                org.bukkit.Bukkit.getPluginManager().callEvent(event);
-            } catch (final Throwable ex) {
-                plugin.getSLF4JLogger().warn("ArenaRegenCompleteEvent dispatch failed", ex);
-            }
-        });
-        if (j != null) {
-            if (!j.future.isDone()) {
-                j.future.complete(t);
-            }
-            allJobs.remove(j.id);
-        }
+        job.future.complete(task);
     }
 
     private void playArenaSound(@NotNull final Arena arena, @NotNull final String soundName) {
-        final var sounds = configManager.sounds();
+        final Settings.SoundSettings sounds = configManager.sounds();
         if (!sounds.enabled) return;
-        final org.bukkit.Sound sound = com.dravorax.arenaregendx.util.RegistryUtil.soundFromString(soundName);
+        final Sound sound = RegistryUtil.soundFromString(soundName);
         if (sound == null) return;
-        arenaManager.forEachPlayerInArena(arena, player -> {
-            try {
-                player.playSound(player.getLocation(), sound, sounds.volume, sounds.pitch);
-            } catch (final Throwable t) {
-                plugin.getSLF4JLogger().debug("playSound failed for {}", player.getName(), t);
-            }
-        });
+        arenaManager.forEachPlayerInArena(arena, player ->
+                player.playSound(player.getLocation(), sound, sounds.volume, sounds.pitch));
     }
 
-    private @Nullable ActiveJob findByTask(@NotNull final RegenTask task) {
-        for (final ActiveJob j : allJobs.values()) {
-            if (j.task == task) return j;
-        }
-        return null;
-    }
-
-    /**
-     * Teleport all players inside the arena to the arena's spawn point (if set).
-     * This prevents players from getting stuck inside blocks during regeneration.
-     */
-    private void teleportPlayersToSpawn(@NotNull final com.dravorax.arenaregendx.arena.Arena arena) {
+    /** Move players inside the arena to its spawn (if set) before blocks change. Folia-safe. */
+    private void teleportPlayersToSpawn(@NotNull final Arena arena, @NotNull final World world) {
         if (!arena.hasSpawn()) {
-            return; // no spawn set — players stay where they are
+            return;
         }
-        final org.bukkit.World world = org.bukkit.Bukkit.getWorld(arena.worldName());
-        if (world == null) return;
-        final org.bukkit.Location spawn = new org.bukkit.Location(
-                world, arena.spawnX(), arena.spawnY(), arena.spawnZ(),
+        final Location spawn = new Location(world, arena.spawnX(), arena.spawnY(), arena.spawnZ(),
                 arena.spawnYaw(), arena.spawnPitch());
-        arenaManager.forEachPlayerInArena(arena, player -> {
-            try {
-                player.teleport(spawn);
-            } catch (final Throwable t) {
-                plugin.getSLF4JLogger().warn("Could not teleport {} to spawn", player.getName(), t);
-            }
-        });
+        arenaManager.forEachPlayerInArena(arena, player ->
+                player.teleportAsync(spawn, PlayerTeleportEvent.TeleportCause.PLUGIN));
     }
 
-    /**
-     * @return the number of jobs waiting in the queue (excluding the running one).
-     */
+    // -----------------------------------------------------------------------
+    // Queries / cancellation
+    // -----------------------------------------------------------------------
+
+    /** @return jobs waiting behind the running one. */
     public int queueSize() {
         return queue.size();
     }
 
-    /**
-     * @return the number of active jobs (queue + running).
-     */
+    /** @return queued + running jobs. */
     public int activeCount() {
         return allJobs.size();
     }
 
-    /**
-     * Cancel a running or queued job for an arena.
-     */
-    public boolean cancel(@NotNull final String arenaName) {
-        final String key = arenaName.toLowerCase(java.util.Locale.ROOT);
-        // Invalidate any in-flight snapshot-load / enqueue that still holds starting.
-        boolean any = starting.remove(key) != null;
-        final java.util.concurrent.atomic.AtomicBoolean cancelledQueued =
-                new java.util.concurrent.atomic.AtomicBoolean(false);
-        queue.removeIf(job -> {
-            if (!job.arenaName.equalsIgnoreCase(arenaName)) return false;
-            job.task.cancel();
-            if (job.bar != null) job.bar.hideRemaining();
-            if (!job.future.isDone()) {
-                job.future.completeExceptionally(new RuntimeException("Regen cancelled"));
-            }
-            allJobs.remove(job.id);
-            cancelledQueued.set(true);
-            return true;
-        });
-        any |= cancelledQueued.get();
-        for (final ActiveJob job : List.copyOf(allJobs.values())) {
-            if (job.arenaName.equalsIgnoreCase(arenaName)) {
-                job.task.cancel();
-                if (job.bar != null) job.bar.hideRemaining();
-                if (!job.future.isDone()) {
-                    job.future.completeExceptionally(new RuntimeException("Regen cancelled"));
-                }
-                allJobs.remove(job.id);
-                any = true;
-            }
-        }
-        if (current != null && current.arenaName.equalsIgnoreCase(arenaName)) {
-            current.task.cancel();
-            if (current.bar != null) current.bar.hideRemaining();
-            // Do NOT clear batchInFlight here — the in-flight region callback
-            // still owns it and will clear it in its finally block.
-            current = null;
-            any = true;
-        }
-        final Arena arena = arenaManager.getArena(arenaName);
-        if (arena != null && arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.REGENERATING) {
-            arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.READY);
-            arenaManager.saveArena(arena);
-        }
-        return any;
-    }
-
-    /**
-     * @return true if a regeneration is currently running.
-     */
+    /** @return true if any restore is running. */
     public boolean isRegenerating() {
-        return current != null && !current.task.isDone();
+        final ActiveJob job = current;
+        return job != null && !job.task.isDone();
     }
 
     public boolean isRegenerating(@NotNull final String arenaName) {
-        if (starting.containsKey(arenaName.toLowerCase(java.util.Locale.ROOT))) {
+        if (starting.containsKey(key(arenaName))) {
             return true;
         }
         for (final ActiveJob job : allJobs.values()) {
@@ -499,82 +376,80 @@ public final class RegenManager {
                 return true;
             }
         }
-        return current != null
-                && current.arenaName.equalsIgnoreCase(arenaName)
-                && !current.task.isDone();
+        return false;
     }
 
-    /**
-     * Cancel all queued jobs and abort the running one (best-effort).
-     */
+    /** @return progress 0..1 of the arena's running restore, or -1 when idle. */
+    public float progress(@NotNull final String arenaName) {
+        for (final ActiveJob job : allJobs.values()) {
+            if (job.arenaName.equalsIgnoreCase(arenaName)) {
+                return job.task.progress();
+            }
+        }
+        return -1f;
+    }
+
+    /** Cancel the running or queued restore of one arena. */
+    public boolean cancel(@NotNull final String arenaName) {
+        boolean any = starting.remove(key(arenaName)) != null;
+        for (final ActiveJob job : List.copyOf(allJobs.values())) {
+            if (job.arenaName.equalsIgnoreCase(arenaName)) {
+                queue.remove(job);
+                job.task.cancel(); // completes the future and cleans up via completeJob
+                if (current == job) {
+                    // The in-flight batch (if any) still owns batchInFlight and releases it.
+                    current = null;
+                }
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    /** Cancel every queued and running restore. */
     public void cancelAll() {
         starting.clear();
         for (final ActiveJob job : List.copyOf(allJobs.values())) {
+            queue.remove(job);
             job.task.cancel();
-            if (job.bar != null) job.bar.hideRemaining();
-            if (!job.future.isDone()) {
-                job.future.completeExceptionally(new RuntimeException("Regen cancelled"));
-            }
-            final Arena arena = arenaManager.getArena(job.arenaName);
-            if (arena != null && arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.REGENERATING) {
-                arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.READY);
-            }
         }
         queue.clear();
-        allJobs.clear();
         current = null;
-        // Leave batchInFlight to the in-flight region finally; forcing false here
-        // can let the driver start another job while a cancelled batch still runs.
     }
 
-    /**
-     * Shutdown: stop the driver and abort in-flight work cleanly.
-     */
+    /** Shutdown: stop the driver and abort in-flight work. */
     public void shutdown() {
         if (driver != null) {
             driver.cancel();
             driver = null;
         }
-        starting.clear();
-        for (final ActiveJob job : List.copyOf(allJobs.values())) {
-            try {
-                job.task.cancel();
-            } catch (final Throwable t) {
-                plugin.getSLF4JLogger().debug("Error cancelling regen job during shutdown", t);
-            }
-            if (job.bar != null) job.bar.hideRemaining();
-            if (!job.future.isDone()) {
-                job.future.completeExceptionally(new RuntimeException("Plugin shutting down"));
-            }
-            final Arena arena = arenaManager.getArena(job.arenaName);
-            if (arena != null && arena.status() == com.dravorax.arenaregendx.arena.ArenaStatus.REGENERATING) {
-                arena.setStatus(com.dravorax.arenaregendx.arena.ArenaStatus.READY);
-            }
-        }
+        cancelAll();
         allJobs.clear();
-        queue.clear();
-        current = null;
         batchInFlight = false;
         plugin.getSLF4JLogger().info("Regeneration queue shut down.");
     }
 
-    /**
-     * Active job record.
-     */
+    private static @NotNull String key(@NotNull final String arenaName) {
+        return arenaName.toLowerCase(Locale.ROOT);
+    }
+
+    private static @NotNull Throwable unwrap(@NotNull final Throwable t) {
+        return t instanceof java.util.concurrent.CompletionException && t.getCause() != null ? t.getCause() : t;
+    }
+
+    /** Active job record. */
     private static final class ActiveJob {
         final UUID id;
         final String arenaName;
         final RegenTask task;
         final CompletableFuture<RegenTask> future;
-        final RegenProgressBar bar;
+        final @Nullable RegenProgressBar bar;
         final UUID token;
         final int speedPercent;
 
         ActiveJob(final UUID id, final String arenaName, final RegenTask task,
-                  final CompletableFuture<RegenTask> future,
-                  @Nullable final RegenProgressBar bar,
-                  final UUID token,
-                  final int speedPercent) {
+                  final CompletableFuture<RegenTask> future, @Nullable final RegenProgressBar bar,
+                  final UUID token, final int speedPercent) {
             this.id = id;
             this.arenaName = arenaName;
             this.task = task;

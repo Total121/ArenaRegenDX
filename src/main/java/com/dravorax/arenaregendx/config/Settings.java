@@ -1,6 +1,6 @@
 /*
  * ArenaRegenDX - Premium Arena Regeneration Plugin
- * Copyright (C) 2024 DravoraX
+ * Copyright (C) 2026 DravoraX. All rights reserved.
  */
 
 package com.dravorax.arenaregendx.config;
@@ -8,6 +8,8 @@ package com.dravorax.arenaregendx.config;
 import org.bukkit.Particle;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.jetbrains.annotations.NotNull;
+
+import java.util.Locale;
 
 /**
  * Typed settings holders for each config file. Keeping these as plain immutable
@@ -73,10 +75,8 @@ public final class Settings {
         public final double tpsThrottle;
         public final double tpsCrawl;
         public final int chunkBatchSize;
-        public final boolean asyncSnapshots;
-        public final boolean asyncCompression;
         public final int queueWorkerThreads;
-        public final boolean autoMatchRegen;
+        /** Minimum seconds between two automatic (explosion / fire / piston) restores of one arena. */
         public final int regenCountdownSeconds;
         public final double maxTickMillis;
         public final boolean deltaSkip;
@@ -90,61 +90,29 @@ public final class Settings {
         /** Global restore throughput multiplier (percent). 100 = default. */
         public final int regenSpeedPercent;
 
-        private PerformanceSettings(final int maxBlockBudget, final double tpsFull,
-                                    final double tpsThrottle, final double tpsCrawl,
-                                    final int chunkBatchSize, final boolean asyncSnapshots,
-                                    final boolean asyncCompression, final int queueWorkerThreads,
-                                    final boolean autoMatchRegen, final int regenCountdownSeconds,
-                                    final double maxTickMillis, final boolean deltaSkip,
-                                    final boolean skipUnchangedTiles, final boolean dirtyTracking,
-                                    final double dirtyFullThreshold, final int parallelChunks,
-                                    final boolean nmsWrites, final boolean nbtTiles,
-                                    final boolean progressBar, final int regenSpeedPercent) {
-            this.maxBlockBudget = maxBlockBudget;
-            this.tpsFull = tpsFull;
-            this.tpsThrottle = tpsThrottle;
-            this.tpsCrawl = tpsCrawl;
-            this.chunkBatchSize = chunkBatchSize;
-            this.asyncSnapshots = asyncSnapshots;
-            this.asyncCompression = asyncCompression;
-            this.queueWorkerThreads = queueWorkerThreads;
-            this.autoMatchRegen = autoMatchRegen;
-            this.regenCountdownSeconds = regenCountdownSeconds;
-            this.maxTickMillis = maxTickMillis;
-            this.deltaSkip = deltaSkip;
-            this.skipUnchangedTiles = skipUnchangedTiles;
-            this.dirtyTracking = dirtyTracking;
-            this.dirtyFullThreshold = dirtyFullThreshold;
-            this.parallelChunks = parallelChunks;
-            this.nmsWrites = nmsWrites;
-            this.nbtTiles = nbtTiles;
-            this.progressBar = progressBar;
-            this.regenSpeedPercent = regenSpeedPercent;
+        private PerformanceSettings(final FileConfiguration c) {
+            this.maxBlockBudget = Math.max(100, c.getInt("max-block-budget", 20_000));
+            this.tpsFull = c.getDouble("tps-full", 19.5);
+            this.tpsThrottle = c.getDouble("tps-throttle", 18.0);
+            this.tpsCrawl = c.getDouble("tps-crawl", 14.0);
+            this.chunkBatchSize = Math.max(1, c.getInt("chunk-batch-size", 8));
+            this.queueWorkerThreads = Math.max(1, Math.min(8, c.getInt("queue-worker-threads", 2)));
+            this.regenCountdownSeconds = Math.max(0, c.getInt("auto-regen-cooldown-seconds",
+                    c.getInt("regen-countdown-seconds", 3)));
+            this.maxTickMillis = Math.max(0.4, Math.min(25.0, c.getDouble("max-tick-millis", 6.0)));
+            this.deltaSkip = c.getBoolean("delta-skip", true);
+            this.skipUnchangedTiles = c.getBoolean("skip-unchanged-tiles", false);
+            this.dirtyTracking = c.getBoolean("dirty-tracking", true);
+            this.dirtyFullThreshold = Math.max(0.05, Math.min(1.0, c.getDouble("dirty-full-threshold", 0.35)));
+            this.parallelChunks = Math.max(1, Math.min(64, c.getInt("parallel-chunks", 4)));
+            this.nmsWrites = c.getBoolean("nms-writes", true);
+            this.nbtTiles = c.getBoolean("nbt-tiles", true);
+            this.progressBar = c.getBoolean("progress-bar", true);
+            this.regenSpeedPercent = Math.max(10, Math.min(500, c.getInt("regen-speed-percent", 100)));
         }
 
         public static @NotNull PerformanceSettings from(@NotNull final FileConfiguration c) {
-            return new PerformanceSettings(
-                    c.getInt("max-block-budget", 20_000),
-                    c.getDouble("tps-full", 19.5),
-                    c.getDouble("tps-throttle", 18.0),
-                    c.getDouble("tps-crawl", 14.0),
-                    c.getInt("chunk-batch-size", 8),
-                    c.getBoolean("async-snapshots", true),
-                    c.getBoolean("async-compression", true),
-                    Math.max(1, c.getInt("queue-worker-threads", 2)),
-                    c.getBoolean("auto-match-regen", true),
-                    Math.max(0, c.getInt("regen-countdown-seconds", 3)),
-                    c.getDouble("max-tick-millis", 6.0),
-                    c.getBoolean("delta-skip", true),
-                    c.getBoolean("skip-unchanged-tiles", false),
-                    c.getBoolean("dirty-tracking", true),
-                    c.getDouble("dirty-full-threshold", 0.35),
-                    Math.max(1, c.getInt("parallel-chunks", 4)),
-                    c.getBoolean("nms-writes", true),
-                    c.getBoolean("nbt-tiles", true),
-                    c.getBoolean("progress-bar", true),
-                    Math.max(10, Math.min(500, c.getInt("regen-speed-percent", 100)))
-            );
+            return new PerformanceSettings(c);
         }
     }
 
@@ -154,10 +122,9 @@ public final class Settings {
     public static final class StorageSettings {
         public final CompressionType compression;
         public final int compressionLevel;
-        public final boolean deltaStorage;
         public final int maxSnapshotsPerArena;
-        public final boolean asyncDiskWrite;
-        public final int writeBufferSize;
+        /** Memory budget for decoded snapshots kept in RAM (megabytes). */
+        public final int cacheMemoryMb;
 
         public enum CompressionType {
             /** No compression — fastest, largest files. */
@@ -169,32 +136,25 @@ public final class Settings {
         }
 
         private StorageSettings(final CompressionType compression, final int compressionLevel,
-                                final boolean deltaStorage, final int maxSnapshotsPerArena,
-                                final boolean asyncDiskWrite, final int writeBufferSize) {
+                                final int maxSnapshotsPerArena, final int cacheMemoryMb) {
             this.compression = compression;
             this.compressionLevel = compressionLevel;
-            this.deltaStorage = deltaStorage;
             this.maxSnapshotsPerArena = maxSnapshotsPerArena;
-            this.asyncDiskWrite = asyncDiskWrite;
-            this.writeBufferSize = writeBufferSize;
+            this.cacheMemoryMb = cacheMemoryMb;
         }
 
         public static @NotNull StorageSettings from(@NotNull final FileConfiguration c) {
-            final String compStr = c.getString("compression", "ZLIB").toUpperCase();
             CompressionType ct;
             try {
-                ct = CompressionType.valueOf(compStr);
+                ct = CompressionType.valueOf(c.getString("compression", "ZLIB").trim().toUpperCase(Locale.ROOT));
             } catch (final IllegalArgumentException e) {
                 ct = CompressionType.ZLIB;
             }
-            if (ct == null) ct = CompressionType.ZLIB;
             return new StorageSettings(
                     ct,
                     Math.max(-1, Math.min(9, c.getInt("compression-level", 6))),
-                    c.getBoolean("delta-storage", true),
                     Math.max(1, c.getInt("max-snapshots-per-arena", 10)),
-                    c.getBoolean("async-disk-write", true),
-                    Math.max(1024, c.getInt("write-buffer-size", 65536))
+                    Math.max(16, c.getInt("cache-memory-mb", 256))
             );
         }
     }

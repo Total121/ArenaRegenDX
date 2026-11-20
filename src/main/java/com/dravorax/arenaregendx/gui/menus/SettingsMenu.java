@@ -101,9 +101,6 @@ public final class SettingsMenu {
         if (slot == SLOT_RELOAD) {
             gm.configManager().reload();
             gm.plugin().applyRuntimeSettings();
-            final var p = gm.configManager().performance();
-            gm.plugin().tpsMonitor().configure(p.maxBlockBudget, p.tpsFull, p.tpsThrottle, p.tpsCrawl, p.maxTickMillis);
-            gm.plugin().selectionVisualizer().restart();
             player.sendMessage(ColorUtil.mini("<dark_gray>› <green>"
                     + ColorUtil.smallCaps("configuration reloaded")));
             gm.openSettings(player);

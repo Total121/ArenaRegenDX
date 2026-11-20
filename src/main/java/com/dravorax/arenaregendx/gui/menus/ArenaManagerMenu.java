@@ -15,9 +15,10 @@ import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.jetbrains.annotations.NotNull;
 
-import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
 
 /**
@@ -41,11 +42,20 @@ public final class ArenaManagerMenu {
     private static final int SLOT_BACK = 49;
     private static final int SLOT_PAGE = 47;
 
-    private static final SimpleDateFormat DATE_FMT = new SimpleDateFormat("yyyy-MM-dd HH:mm");
+    /** Immutable and thread-safe (menus are built on many region threads under Folia). */
+    private static final DateTimeFormatter DATE_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
 
     public static @NotNull Inventory build(@NotNull final GuiManager gm, @NotNull final Player player,
                                            final int page) {
-        final GuiManager.GuiHolder holder = new GuiManager.GuiHolder(GuiManager.GuiType.ARENA_MANAGER, page);
+        final List<Arena> arenas = new ArrayList<>(gm.arenaManager().all());
+        arenas.sort((a, b) -> a.name().compareToIgnoreCase(b.name()));
+
+        final int total = arenas.size();
+        final int totalPages = Math.max(1, (total + PAGE_SIZE - 1) / PAGE_SIZE);
+        final int safePage = Math.min(Math.max(0, page), totalPages - 1);
+        // The holder must carry the clamped page, or card clicks map to the wrong arena.
+        final GuiManager.GuiHolder holder = new GuiManager.GuiHolder(GuiManager.GuiType.ARENA_MANAGER, safePage);
         final Inventory inv = Bukkit.createInventory(holder, 54, ColorUtil.mini(
                 "<dark_gray>› <aqua>" + ColorUtil.smallCaps("arenas") + " <dark_gray>‹"));
         holder.inventory(inv);
@@ -54,13 +64,6 @@ public final class ArenaManagerMenu {
         inv.setItem(4, GuiItems.head(GuiHeads.ARENAS,
                 ColorUtil.named("<aqua>", "arenas"),
                 List.of(ColorUtil.loreLine("click a head to open the editor"))));
-
-        final List<Arena> arenas = new ArrayList<>(gm.arenaManager().all());
-        arenas.sort((a, b) -> a.name().compareToIgnoreCase(b.name()));
-
-        final int total = arenas.size();
-        final int totalPages = Math.max(1, (total + PAGE_SIZE - 1) / PAGE_SIZE);
-        final int safePage = Math.min(Math.max(0, page), totalPages - 1);
         final int start = safePage * PAGE_SIZE;
         final int end = Math.min(total, start + PAGE_SIZE);
 
@@ -89,7 +92,7 @@ public final class ArenaManagerMenu {
             default -> GuiHeads.ARENA_READY;
         };
         final String lastRegen = a.lastRegeneratedAt() > 0
-                ? DATE_FMT.format(new Date(a.lastRegeneratedAt()))
+                ? DATE_FMT.format(Instant.ofEpochMilli(a.lastRegeneratedAt()))
                 : "never";
         return GuiItems.head(hash,
                 ColorUtil.named("<aqua>", a.name()),
@@ -98,7 +101,7 @@ public final class ArenaManagerMenu {
                         ColorUtil.loreLine("blocks  " + a.blockCount()),
                         ColorUtil.loreLine("snapshot  #" + a.latestSnapshotId()),
                         ColorUtil.loreLine("last regen  " + lastRegen),
-                        ColorUtil.loreLine("status  " + a.status().name().toLowerCase()),
+                        ColorUtil.loreLine("status  " + a.status().name().toLowerCase(java.util.Locale.ROOT)),
                         "",
                         ColorUtil.named("<gold>", "click  ·  instant regen is inside")
                 ));
@@ -115,7 +118,10 @@ public final class ArenaManagerMenu {
             return;
         }
         if (slot == SLOT_NEXT) {
-            gm.openArenaManager(player, page + 1);
+            final int pages = Math.max(1, (gm.arenaManager().count() + PAGE_SIZE - 1) / PAGE_SIZE);
+            if (page + 1 < pages) {
+                gm.openArenaManager(player, page + 1);
+            }
             return;
         }
         int cardIndex = -1;

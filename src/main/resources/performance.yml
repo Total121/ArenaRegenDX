@@ -1,57 +1,66 @@
+# ============================================================================
 # ArenaRegenDX — Performance
-# Defaults are tuned so a healthy 20 TPS Paper box never feels the restore.
+# ============================================================================
+# Defaults are tuned so a healthy 20 TPS server never feels a restore.
+# Apply changes with /ardx reload.
 
-# Max block writes per tick at full TPS. Actual work also stops when the
-# millisecond budget is spent, whichever comes first.
+# Max block writes per tick at full TPS. Work also stops when the time budget
+# below is spent, whichever comes first.
 max-block-budget: 20000
 
-# Hard cap on restore time inside one tick (milliseconds). This is the
-# setting that keeps TPS stable on huge arenas. 6ms is ~12% of a tick.
+# Hard cap on restore time inside one tick, in milliseconds (0.4 - 12).
+# This is the setting that keeps TPS stable on huge arenas. 6 ms is ~12% of a tick.
 max-tick-millis: 6.0
 
-# Global restore speed multiplier (percent).
-# 40 = slow, 100 = normal, 200 = fast, 350 = max.
-# Per-arena overrides live in arenas.yml as regen-speed-percent (-1 = inherit).
+# Global restore speed multiplier in percent (10 - 500). Scales both budgets.
+# Presets: 40 = slow, 100 = normal, 200 = fast, 350 = max.
+# Per-arena overrides: /ardx speed <arena> <value> (-1 / inherit = use this).
+# A single tick never spends more than 25 ms restoring, whatever the speed.
 regen-speed-percent: 100
 
-# Skip blocks that already match the snapshot (and air-to-air).
-# Leave on. Chests still restore because they carry tile data.
-delta-skip: true
-
-# If true, skip tile restore when the BlockData already matches.
-# Default false so looted chests are refilled.
-skip-unchanged-tiles: false
-
-# Record broken/placed/exploded voxels and restore only those.
-# Empty set after restart still does a full restore (safe).
-dirty-tracking: true
-
-# If more than this fraction of the arena is dirty, do a full restore.
-dirty-full-threshold: 0.35
-
-# Use Paper NMS Level.setBlock (no neighbour physics). Falls back to Bukkit.
-nms-writes: true
-
-# Prefer CraftBlockEntityState snapshot NBT for chests/signs/etc.
-nbt-tiles: true
-
-# Folia: restore this many chunks per tick (each on its region thread).
-# Paper stays at 1 regardless — serial is safer on a single scheduler.
-parallel-chunks: 4
-
-# Adventure boss bar while a restore is running.
-progress-bar: true
-
+# Budget scaling by server TPS: 100% above tps-full, 50% at tps-throttle,
+# 10% at tps-crawl and below.
 tps-full: 19.5
 tps-throttle: 18.0
 tps-crawl: 14.0
 
-# Chunks scanned per tick during snapshot capture.
+# Skip voxels that already match the snapshot (and air-to-air). Leave on.
+# Containers and other block entities are still refilled because they carry data.
+delta-skip: true
+
+# If true, a block entity (chest, sign, ...) whose block already matches the
+# snapshot keeps its current contents. Default false: looted chests are refilled.
+skip-unchanged-tiles: false
+
+# Record broken / placed / exploded voxels so automatic restores (explosion
+# auto-regen, auto-reset timers) rewrite only what changed. Tracking starts
+# trusted after a snapshot or full restore; until then restores are full.
+dirty-tracking: true
+
+# If more than this fraction of an arena is dirty, do a full restore instead.
+dirty-full-threshold: 0.35
+
+# Use the server's internal block setter (no neighbour physics, identity
+# compare for delta skip). Falls back to the Bukkit API automatically.
+nms-writes: true
+
+# Capture / restore block entities (chests, signs, banners, ...) as full NBT.
+nbt-tiles: true
+
+# Folia only: chunks restored per tick, each on its own region thread.
+# Paper restores on the main thread within the time budget above.
+parallel-chunks: 4
+
+# Boss bar for players inside an arena while it is being restored.
+progress-bar: true
+
+# Chunks scheduled per tick while capturing a snapshot. Block data is copied
+# on the region thread and parsed off-thread, so this mostly bounds chunk loads.
 chunk-batch-size: 8
 
-async-snapshots: true
-async-compression: true
+# Threads used to compress snapshots (1 - 8).
 queue-worker-threads: 2
 
-auto-match-regen: true
-regen-countdown-seconds: 3
+# Minimum seconds between two automatic restores of the same arena
+# (explosion / fire / piston auto-regen).
+auto-regen-cooldown-seconds: 3

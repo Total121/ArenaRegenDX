@@ -47,6 +47,9 @@ import java.util.Map;
  */
 public final class EntitySerializer {
 
+    /** Trailer marker for the facing of hanging entities (item frames, paintings). */
+    private static final int FACING_MARKER = 0x46;
+
     private EntitySerializer() {
         // static utility
     }
@@ -66,6 +69,11 @@ public final class EntitySerializer {
             final ByteArrayOutputStream bout = new ByteArrayOutputStream(128);
             final DataOutputStream out = new DataOutputStream(bout);
             handler.write(out, entity);
+            if (entity instanceof org.bukkit.entity.Hanging hanging) {
+                // Appended trailer (older readers stop before it): which wall the frame/painting hangs on.
+                out.writeByte(FACING_MARKER);
+                writeNullableString(out, hanging.getFacing().name());
+            }
             out.flush();
             final Location loc = entity.getLocation();
             return new Snapshot.EntityPayload(
@@ -96,26 +104,36 @@ public final class EntitySerializer {
         }
         final Location loc = new Location(world, payload.x(), payload.y(), payload.z(),
                 payload.yaw(), payload.pitch());
-        final Entity entity;
+        final Class<? extends Entity> entityClass = type.getEntityClass();
+        if (entityClass == null) {
+            return null;
+        }
         try {
-            entity = world.spawn(loc, type.getEntityClass());
+            // Apply the payload before the entity joins the world (no flicker, correct wall for frames).
+            return world.spawn(loc, entityClass, entity -> apply(entity, payload.payload()));
         } catch (final Throwable t) {
             return null;
         }
-        if (entity == null) {
-            return null;
-        }
+    }
+
+    private static void apply(@NotNull final Entity entity, final byte @NotNull [] data) {
         final EntityHandler handler = handlerFor(entity);
-        if (handler != null) {
-            try {
-                final DataInputStream in = new DataInputStream(
-                        new java.io.ByteArrayInputStream(payload.payload()));
-                handler.read(in, entity);
-            } catch (final IOException ignored) {
-                // ByteArrayInputStream doesn't throw; defensive.
-            }
+        if (handler == null) {
+            return;
         }
-        return entity;
+        try {
+            final DataInputStream in = new DataInputStream(new java.io.ByteArrayInputStream(data));
+            handler.read(in, entity);
+            if (entity instanceof org.bukkit.entity.Hanging hanging
+                    && in.available() > 0 && in.readUnsignedByte() == FACING_MARKER) {
+                final String face = readNullableString(in);
+                if (face != null && !face.isEmpty()) {
+                    hanging.setFacingDirection(org.bukkit.block.BlockFace.valueOf(face), true);
+                }
+            }
+        } catch (final IOException | IllegalArgumentException ignored) {
+            // Truncated / unknown values: keep the defaults chosen by the server.
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -272,11 +290,12 @@ public final class EntitySerializer {
             final String artName = readNullableString(in);
             if (artName != null && !artName.isEmpty()) {
                 try {
-                    final NamespacedKey key = artName.contains(":")
-                            ? NamespacedKey.fromString(artName.toLowerCase())
-                            : NamespacedKey.minecraft(artName.toLowerCase().replace('_', '.'));
-                    final Art art = Registry.ART.get(key);
-                    if (art != null) p.setArt(art);
+                    final String lower = artName.toLowerCase(java.util.Locale.ROOT);
+                    final NamespacedKey key = lower.contains(":")
+                            ? NamespacedKey.fromString(lower)
+                            : NamespacedKey.minecraft(lower);
+                    final Art art = key == null ? null : Registry.ART.get(key);
+                    if (art != null) p.setArt(art, true);
                 } catch (final Exception ignored) {}
             }
         }
